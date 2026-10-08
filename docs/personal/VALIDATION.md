@@ -35,6 +35,25 @@ Initial focused-window captures hid all background effects behind the base's fil
 
 A read-only reviewer inspected the port for renderer and color-path failures; reviewer inspection is not independent test execution. Passing these checks does not establish HDR screenshots, screencasts, direct scanout transitions, perceptual HDR correctness or performance improvements.
 
+## SDR appearance follow-up (2026-10-09)
+
+The default independent example now uses the Glass parameters in the pinned Niri-glass README. `glass-test-preset.kdl` retains the previous validation settings. This follow-up changes examples and opt-in validation tools; production renderer/shader behavior is unchanged.
+
+`scripts/personal-compare-glass.sh` successfully compiled and executed the pinned, unmodified upstream Glass shader and the ported shader with the same actual GLES renderer. Both used one opaque SDR sRGB background capture, identical cached blur (three passes, offset 2), 960×640 output, window position (80,48), window size 640×544, scale 1, effective radius 21, noise 0 and background saturation 1. The original shader's rounding/postprocess helpers were verified identical to its official base; upstream-only padding defaults to zero. No HDR conversion helper was inserted into the reference shader. The comparison omits the foreground window so its opacity/tint cannot mask differences.
+
+| Compared images | Mean absolute RGB error (0–255) | Maximum channel error |
+| --- | --- | --- |
+| Previous preset vs aligned preset, whole window | 12.2763 | 122 |
+| Port vs original shader, aligned preset, whole window | 0.9143 | 119 |
+| Same comparison excluding a 48-pixel edge band | 0.0337 | 1 |
+| Aligned port with blur vs without blur | 19.6820 | 124 |
+
+The central region is close for this scene; the large maximum errors remain near edges. The port's corrected coordinate mapping and edge/alpha handling are retained, so this does not claim pixel-identical output or perceptual equivalence. The visible old/new difference confirms that preset selection matters. The blur/sharp difference and renderer draw audit verify that the probe actually exercised blur and Glass rather than comparing inactive configurations.
+
+Evidence: `validation/appearance/comparison.html`, `comparison.json`, `measurements.json`, exported `reference.frag`/`ported.frag`, and six PNGs. The records include source revisions, shader hashes, effective configurations and source dirty state. This is a same-scene shader comparison, not execution of the entire original compositor, and does not verify HDR output.
+
+A separate nested release trial switched previous → aligned → previous settings in the same GTK scene. At 1871×2135, old/aligned screenshots differed in 2,385,280 pixels; restoring the previous preset restored the screenshot exactly. It exited with status 0 and used only its own IPC socket. Evidence: `validation/appearance/nested-k27dhh56/` (the binary was the preceding release commit, recorded in `result.json`; renderer code is unchanged by this follow-up). Five existing Glass renderer regression tests passed again. The earlier full workspace results above were not rerun solely for this example/manual-tool change.
+
 ## Detected display and limits of this record
 
 The current desktop exposed one connected output: `DP-1`, ViewSonic VG2481-4K, 3840×2160 at 60 Hz, scale 1.75. Its EDID advertises BT.2020 RGB, PQ/ST2084 and HDR static metadata, with desired maximum luminance 400 cd/m², maximum frame-average luminance 400 cd/m² and minimum approximately 0.098 cd/m². These are display declarations, not measurements of actual brightness. The example does not invent a peak-luminance override.

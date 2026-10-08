@@ -89,7 +89,7 @@ For another machine, first transfer this repository/branch or a Git bundle prese
 
 The selected niri and Smithay manifests declare Rust 1.87 as their minimum. The locked dependency set was tested with Rust/Cargo 1.98.0 on CachyOS; the minimum toolchain was not tested. Upstream Cargo features are unchanged, including Vulkan support. The build requires a C toolchain, `pkg-config`, Wayland, xkbcommon, libinput, libudev, libseat, EGL/GLES/GBM, libdisplay-info, Pango/Cairo, PipeWire, and Vulkan headers/loader. On this Arch-derived host, libseat is supplied by `seatd`. Check the repository's normal build documentation for package equivalents on other distributions.
 
-The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates both example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
+The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates all three example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
 
 The helper explicitly builds into this checkout's `target/`, including when a caller has set `CARGO_TARGET_DIR` or a Cargo target-dir configuration. Its release binary is `target/release/niri`. The independent trial artifact on this host is `/home/hewel/Codes/niri/personal/artifacts/niri-hdr-glass`. The unmodified debug baseline is retained as `niri-spicy-baseline` beside it.
 
@@ -112,6 +112,30 @@ The example sets `draw-border-with-background false`: spicy's default filled foc
 Do not add `--session` for this independent trial. `Mod+O` toggles overview, `Mod+F` fullscreen and `Mod+Shift+E` exits only the trial compositor. Niri's default `Mod` is Alt in a nested session and Super on the TTY backend. The examples have no desktop autostarts and the SDR example does not enable HDR. Keep experimental changes in copies of these files.
 
 For a real TTY/DRM HDR trial and expected observations, follow [VALIDATION.md](VALIDATION.md). Nested rendering cannot establish physical HDR correctness.
+
+## Compare the Glass appearance
+
+`examples/personal/glass.kdl` uses the selected Niri-glass README's Glass preset. The previous test preset is retained in `glass-test-preset.kdl`. In particular, the aligned preset disables physical refraction, lens distortion and fringing, reduces glow weight to 0.0001, and sets power factor 10, refraction power 1 and vibrancy 0.2. These settings materially change the appearance. Global blur settings remain the trial's three passes and offset 2; the upstream README does not specify those settings.
+
+For an automated old/aligned/restored comparison in one separate nested compositor, run from this checkout in the existing Wayland desktop:
+
+```sh
+python3 scripts/personal-glass-trial.py \
+    --binary ../artifacts/niri-hdr-glass --output-root ../validation/appearance
+```
+
+The script creates a unique artifact directory and addresses only the child compositor's IPC socket. It launches the same GTK demo and changes only its trial configuration. Screenshots, version/output records and logs are retained there. No desktop session switch or active configuration change is performed.
+
+The opt-in renderer probe compares the ported shader against the **unmodified** Glass shader extracted from the pinned Git object, with the same SDR texture, blur cache, geometry and parameters:
+
+```sh
+# ../Niri-glass must contain GLASS_REV from versions.env; its installer is not used.
+./scripts/personal-compare-glass.sh ../Niri-glass ../validation/appearance
+```
+
+This executes actual GLES compilation/drawing/readback using the existing software-renderer test convention. Python Pillow generates `comparison.html`, a local interactive image slider, and `measurements.json`; Pillow is a reporting dependency, not a compositor build dependency. The probe is an ignored manual test so normal tests do not need the reference checkout. It exports both shader sources and records exact revisions, parameters and source dirty state. Only the test-owned shader slot is swapped; the production renderer and HDR dispatch remain unchanged.
+
+This is a same-scene SDR **shader** comparison, not a run of the complete upstream Glass compositor. It isolates the background effect without a foreground window's tint/opacity. Test results show close central pixels with the aligned preset, but remaining edge differences; the port retains its window/texture coordinate, premultiplied-alpha and HDR integration fixes. Natural wallpaper, application transparency and display scaling can change the visible result. Use the independent demo for visual acceptance and the real TTY checklist for HDR acceptance.
 
 ## Update safely
 

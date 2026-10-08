@@ -9,6 +9,7 @@ mod animations;
 mod color_management;
 mod floating;
 mod fullscreen;
+mod glass_appearance;
 mod layer_shell;
 mod liquid_glass;
 mod remove_output;
