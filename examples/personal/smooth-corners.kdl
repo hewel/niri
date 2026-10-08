@@ -1,0 +1,12 @@
+// Independent smooth-corner trial; the active desktop configuration is untouched.
+include "glass.kdl"
+window-rule {
+    match app-id="^personal-glass-demo$"
+    geometry-corner-radius 32 smoothing=0.65
+    clip-to-geometry true
+    shadow { on; softness 24; spread 0; draw-behind-window false; }
+}
+binds {
+    Mod+Minus { set-column-width "-10%"; }
+    Mod+Equal { set-column-width "+10%"; }
+}

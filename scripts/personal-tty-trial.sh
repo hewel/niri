@@ -2,7 +2,7 @@
 # Explicit SDR/HDR trial on a real Linux virtual console, without session setup.
 set -euo pipefail
 usage() {
-    printf 'Usage: %s [sdr|hdr|video]\nDefault: sdr. Run after logging in on Ctrl+Alt+F3.\n' "$0"
+    printf 'Usage: %s [sdr|hdr|video|smooth]\nDefault: sdr. Run after logging in on Ctrl+Alt+F3.\n' "$0"
 }
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
     usage
@@ -16,6 +16,7 @@ case ${1:-sdr} in
     sdr) config_name=glass.kdl ;;
     hdr) config_name=hdr-dp-1.kdl ;;
     video) config_name=hdr-dp-1.kdl ;;
+    smooth) config_name=smooth-corners.kdl ;;
     *) usage >&2; exit 1 ;;
 esac
 trial_console=$(tty || true)
@@ -27,6 +28,9 @@ fi
 trial_script=$(readlink -f -- "${BASH_SOURCE[0]}")
 trial_source=$(cd -- "$(dirname -- "$trial_script")/.." && pwd)
 trial_binary="$trial_source/../artifacts/niri-hdr-glass"
+if [[ ${1:-sdr} == smooth ]]; then
+    trial_binary="$trial_source/../artifacts/niri-hdr-glass-smooth"
+fi
 if [[ ! -x "$trial_binary" ]]; then
     trial_binary="$trial_source/target/release/niri"
 fi

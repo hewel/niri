@@ -2,6 +2,8 @@
 
 This branch adds GLES Liquid Glass to `losnoco/niri:spicy-main`. Spicy remains the direct integration upstream; official niri is a reference, not a second branch to merge wholesale. The system binary, active desktop configuration and services are not replaced.
 
+An optional [smooth-corner extension](SMOOTH-CORNERS.md) adds `geometry-corner-radius 20 smoothing=0.65`, adapting Lisse's Figma squircle corner construction. Omitted or zero smoothing keeps the existing circular corners. Its separate example and `niri-hdr-glass-smooth` artifact are for independent trials; the prepared daily session is not automatically upgraded.
+
 ## Source boundary
 
 The full source records are also machine-readable in [versions.env](versions.env).
