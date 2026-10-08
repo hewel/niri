@@ -1,0 +1,16 @@
+// Previous validation preset, retained for an otherwise identical A/B trial.
+include "glass.kdl"
+window-rule {
+    match app-id="^personal-glass-demo$"
+    background-effect {
+        liquid-glass {
+            power-factor 3
+            refraction-power 0.6
+            physical-refraction 1
+            lens-distortion 0.25
+            glow-weight 0.08
+            fringing 0.2
+            vibrancy 0.12
+        }
+    }
+}
