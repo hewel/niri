@@ -1041,8 +1041,6 @@ pub struct BlurPart {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
-    #[knuffel(child)]
-    pub liquid_glass: Option<LiquidGlassPart>,
 }
 
 impl MergeWith<BlurPart> for Blur {
@@ -1118,7 +1116,7 @@ pub struct LiquidGlassPart {
     #[knuffel(child, unwrap(argument))]
     pub refraction_power: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
-    pub glow_weight: Option<FloatOrInt<-100, 100>>,
+    pub glow_weight: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
     pub edge_lighting: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
@@ -1151,8 +1149,9 @@ pub struct LiquidGlassPart {
 
 impl MergeWith<LiquidGlassPart> for LiquidGlass {
     fn merge_with(&mut self, part: &LiquidGlassPart) {
-        // As with blur: a later block enables the effect unless it explicitly says off.
-        self.off = part.off.is_some_and(|off| off.0);
+        if let Some(off) = part.off {
+            self.off = off.0;
+        }
         merge!(
             (self, part),
             refraction_strength,
@@ -1227,7 +1226,9 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
         }
 
         if let Some(glass) = &part.liquid_glass {
-            self.liquid_glass.get_or_insert_with(LiquidGlass::default).merge_with(glass);
+            self.liquid_glass
+                .get_or_insert_with(LiquidGlass::default)
+                .merge_with(glass);
         }
     }
 }
@@ -1241,7 +1242,8 @@ mod tests {
 
     #[test]
     fn liquid_glass_rules_merge_and_disable_independently() {
-        let config = Config::parse_mem(r#"
+        let config = Config::parse_mem(
+            r#"
             window-rule {
                 background-effect {
                     blur true
@@ -1265,10 +1267,12 @@ mod tests {
             }
             window-rule {
                 background-effect {
-                    liquid-glass {}
+                    liquid-glass { off false; }
                 }
             }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let mut effect = BackgroundEffect::default();
         assert!(effect.liquid_glass.is_none());
         effect.merge_with(&config.window_rules[0].background_effect);
@@ -1288,11 +1292,19 @@ mod tests {
 
     #[test]
     fn liquid_glass_rejects_invalid_parameters() {
+        assert!(Config::parse_mem("blur { liquid-glass {}; }").is_err());
         for parameter in [
-            "refraction-strength -1", "power-factor 0", "adaptive-dim 101",
-            "physical-refraction true", "edge-padding 1", "unknown 1",
+            "refraction-strength -1",
+            "power-factor 0",
+            "adaptive-dim 101",
+            "glow-weight -1",
+            "physical-refraction true",
+            "edge-padding 1",
+            "unknown 1",
         ] {
-            let source = format!("window-rule {{ background-effect {{ liquid-glass {{ {parameter}; }}; }}; }}");
+            let source = format!(
+                "window-rule {{ background-effect {{ liquid-glass {{ {parameter}; }}; }}; }}"
+            );
             assert!(Config::parse_mem(&source).is_err(), "accepted {parameter}");
         }
     }
