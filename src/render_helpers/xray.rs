@@ -15,6 +15,7 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::effect_buffer::EffectBuffer;
+use crate::render_helpers::liquid_glass::{self, LiquidGlassOptions};
 use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
 use crate::render_helpers::shader_element::uniform_to_custom_owned;
 use crate::render_helpers::shaders::{mat3_uniform, NiriTexProgram, Shaders};
@@ -81,6 +82,7 @@ pub struct XrayElement {
     saturation: f32,
     bg_color: Color32F,
     program: Option<NiriTexProgram>,
+    liquid_glass: Option<LiquidGlassOptions>,
 }
 
 impl Xray {
@@ -102,6 +104,8 @@ impl Xray {
         blur: bool,
         noise: f32,
         saturation: f32,
+        liquid_glass: Option<LiquidGlassOptions>,
+        glass_only: bool,
         push: &mut dyn FnMut(XrayElement),
     ) {
         let program = Shaders::get(ctx.renderer).and_then(|s| s.postprocess_and_clip.clone());
@@ -126,7 +130,14 @@ impl Xray {
 
         let mut background = self.background[ctx.target as usize].borrow_mut();
         let prev = background.commit();
-        if background.prepare(ctx.renderer, blur) {
+        let (prepared, background_glass) = prepare_buffer(
+            &mut background,
+            ctx.renderer,
+            blur,
+            liquid_glass,
+            glass_only,
+        );
+        if prepared {
             if background.commit() != prev {
                 trace!("background damaged");
             }
@@ -201,7 +212,8 @@ impl Xray {
                     noise,
                     saturation,
                     bg_color: *bg_color,
-                    program: program.clone(),
+                    program: select_program(ctx.renderer, &program, background_glass),
+                    liquid_glass: background_glass,
                 };
                 push(elem);
             }
@@ -213,7 +225,9 @@ impl Xray {
         }
 
         let prev = backdrop.commit();
-        if backdrop.prepare(ctx.renderer, blur) {
+        let (prepared, backdrop_glass) =
+            prepare_buffer(&mut backdrop, ctx.renderer, blur, liquid_glass, glass_only);
+        if prepared {
             if backdrop.commit() != prev {
                 trace!("backdrop damaged");
             }
@@ -251,10 +265,46 @@ impl Xray {
                 noise,
                 saturation,
                 bg_color: self.backdrop_color,
-                program: program.clone(),
+                program: select_program(ctx.renderer, &program, backdrop_glass),
+                liquid_glass: backdrop_glass,
             };
             push(elem);
         }
+    }
+}
+
+fn prepare_buffer<R: NiriRenderer>(
+    buffer: &mut EffectBuffer,
+    renderer: &mut R,
+    blur: bool,
+    glass: Option<LiquidGlassOptions>,
+    glass_only: bool,
+) -> (bool, Option<LiquidGlassOptions>) {
+    if let Some(glass) = glass {
+        let program_available = Shaders::liquid_glass(renderer).is_some();
+        if program_available && buffer.supports_glass() {
+            if let Some(renderer) = renderer.as_gles_renderer() {
+                return (buffer.prepare(renderer, blur), Some(glass));
+            }
+        } else if program_available {
+            liquid_glass::warn_input();
+        }
+        if glass_only {
+            return (false, None);
+        }
+    }
+    (buffer.prepare(renderer, blur), None)
+}
+
+fn select_program<R: NiriRenderer>(
+    renderer: &mut R,
+    ordinary: &Option<NiriTexProgram>,
+    glass: Option<LiquidGlassOptions>,
+) -> Option<NiriTexProgram> {
+    if glass.is_some() {
+        Shaders::get(renderer).and_then(|s| s.liquid_glass_and_clip.borrow().clone())
+    } else {
+        ordinary.clone()
     }
 }
 
@@ -346,10 +396,21 @@ impl RenderElement<GlesRenderer> for XrayElement {
 
         let uniforms = program.is_some().then(|| {
             let mut uniforms = self.compute_uniforms().to_vec();
+            if let Some(glass) = self.liquid_glass {
+                uniforms.extend(liquid_glass::uniforms(glass));
+                uniforms.push(mat3_uniform(
+                    "lg_geo_to_tex",
+                    self.input_to_clip_geo.inverse(),
+                ));
+            }
             uniforms.extend(FrameBlendState::uniforms(frame));
             uniforms
         });
-        crate::audit_texture_program!("postprocess_and_clip", if program.is_some());
+        if self.liquid_glass.is_some() {
+            crate::audit_texture_program!("liquid_glass_and_clip", if program.is_some());
+        } else {
+            crate::audit_texture_program!("postprocess_and_clip", if program.is_some());
+        }
 
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 

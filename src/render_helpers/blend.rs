@@ -509,6 +509,38 @@ impl FrameBlendState {
         self.max_luminance.set(reference_luminance as f32);
     }
 
+    /// Capture GLES xray input in sRGB, then restore the output/capture state.
+    /// Only niri's normal frame-wide blend override is active during xray preparation.
+    pub fn with_sdr<T>(
+        renderer: &mut GlesRenderer,
+        capture: impl FnOnce(&mut GlesRenderer) -> T,
+    ) -> T {
+        let state = Self::get(renderer);
+        let saved = (
+            state.hdr_pq.get(),
+            state.ref_lum_scale.get(),
+            state.max_luminance.get(),
+        );
+        if !saved.0 {
+            // Normal TTY preparation and SDR captures already use sRGB. Keep their
+            // reference white and renderer state, and do no extra work.
+            return capture(renderer);
+        }
+        set_frame_blend(renderer, None);
+        let result = capture(renderer);
+        let blend = saved
+            .0
+            .then_some((f64::from(saved.1) * 10000., f64::from(saved.2)));
+        set_frame_blend(renderer, blend);
+        // An SDR screenshot may have a custom reference white. Restore the exact state,
+        // including it, rather than replacing it with the default SDR reference white.
+        let state = Self::get(renderer);
+        state.hdr_pq.set(saved.0);
+        state.ref_lum_scale.set(saved.1);
+        state.max_luminance.set(saved.2);
+        result
+    }
+
     fn values_from_frame(frame: &GlesFrame) -> (bool, f32, f32) {
         let state: &Self = frame
             .egl_context()

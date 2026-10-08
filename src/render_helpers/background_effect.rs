@@ -14,6 +14,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
+use crate::render_helpers::liquid_glass::LiquidGlassOptions;
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -36,17 +37,19 @@ pub struct BackgroundEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Options {
     pub blur: bool,
-    pub xray: bool,
+    pub xray: Option<bool>,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    pub liquid_glass: Option<LiquidGlassOptions>,
 }
 
 impl Options {
     fn is_visible(&self) -> bool {
-        self.xray
+        self.xray == Some(true)
             || self.blur
             || self.noise.is_some_and(|x| x > 0.)
             || self.saturation.is_some_and(|x| x != 1.)
+            || self.liquid_glass.is_some()
     }
 }
 
@@ -188,18 +191,18 @@ impl BackgroundEffect {
             effect.blur == Some(true)
         };
 
-        let mut options = Options {
+        let liquid_glass = effect.liquid_glass.filter(|glass| !glass.off);
+        if liquid_glass.is_some() && effect.xray == Some(false) {
+            super::liquid_glass::warn_nonxray();
+        }
+
+        let options = Options {
             blur,
-            xray: effect.xray == Some(true),
+            xray: effect.xray,
             noise: effect.noise,
             saturation: effect.saturation,
+            liquid_glass: liquid_glass.filter(|_| effect.xray != Some(false)),
         };
-
-        // If we have some background effect but xray wasn't explicitly set, default it to true
-        // since it's cheaper.
-        if options.is_visible() && effect.xray.is_none() {
-            options.xray = true;
-        }
 
         if self.options == options && self.corner_radius == corner_radius {
             return;
@@ -223,7 +226,12 @@ impl BackgroundEffect {
         xray_pos: XrayPos,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
-        if !self.is_visible() {
+        let mut options = self.options;
+        if options.liquid_glass.is_some() && ctx.renderer.as_gles_renderer().is_none() {
+            super::liquid_glass::warn_vulkan();
+            options.liquid_glass = None;
+        }
+        if !options.is_visible() {
             return;
         }
 
@@ -236,18 +244,18 @@ impl BackgroundEffect {
 
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred.
-        let blur = self.options.blur && !self.blur_config.off;
+        let blur = options.blur && !self.blur_config.off;
         let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
         let noise = if blur { self.blur_config.noise } else { 0. };
-        let noise = self.options.noise.unwrap_or(noise) as f32;
+        let noise = options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {
             self.blur_config.saturation
         } else {
             1.
         };
-        let saturation = self.options.saturation.unwrap_or(saturation) as f32;
+        let saturation = options.saturation.unwrap_or(saturation) as f32;
 
-        if self.options.xray {
+        if options.xray != Some(false) {
             let Some(xray) = ctx.xray else {
                 return;
             };
@@ -260,6 +268,12 @@ impl BackgroundEffect {
                 blur,
                 noise,
                 saturation,
+                options.liquid_glass,
+                !Options {
+                    liquid_glass: None,
+                    ..options
+                }
+                .is_visible(),
                 &mut |elem| push(elem.into()),
             );
         } else {

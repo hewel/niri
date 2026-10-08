@@ -12,6 +12,7 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
+use super::blend::{ContentColor, FrameBlendState};
 use crate::backend::tty_renderer::TtyOffscreen;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::render_helpers::blur::{Blur, BlurOptions, VulkanBlur};
@@ -38,6 +39,8 @@ pub struct EffectBuffer {
 
     /// Commit counter that takes into account both original and blurred texture changes.
     commit_counter: CommitCounter,
+    /// Whether the last captured layer elements were all ordinary sRGB SDR input.
+    plain_sdr: bool,
 }
 
 #[derive(Debug)]
@@ -138,6 +141,7 @@ impl EffectBuffer {
             offscreen: None,
             blur: None,
             commit_counter: CommitCounter::default(),
+            plain_sdr: true,
         }
     }
 
@@ -203,14 +207,34 @@ impl EffectBuffer {
         }
     }
 
+    /// Check the committed content metadata, not its pixel values (PQ is also in [0, 1]).
+    pub fn supports_glass(&self) -> bool {
+        match &self.elements {
+            Elements::New(ElementStore::Gles(elements)) => elements.iter().all(|element| {
+                match element {
+                    LayerSurfaceRenderElement::Wayland(element) => {
+                        element.content() == ContentColor::default()
+                    }
+                    // Niri's own colors/effects are SDR during the scoped capture below.
+                    _ => true,
+                }
+            }),
+            Elements::Unchanged(ElementStore::Gles(_)) => self.plain_sdr,
+            _ => false,
+        }
+    }
+
     /// Prepares the offscreen (and optionally blurred) contents, dispatching to the raw
-    /// renderer that filled the elements.
+    /// renderer that filled the elements. GLES xray consumers expect sRGB captures,
+    /// even if an animation/screenshot asks for them while an HDR state is active.
     pub fn prepare(&mut self, renderer: &mut impl NiriRenderer, blur: bool) -> bool {
         // Borrow-checker friendly two-step: probe the variant before taking the long-lived
         // borrow.
         if renderer.as_gles_renderer().is_some() {
             let renderer = renderer.as_gles_renderer().unwrap();
-            self.prepare_for(renderer, blur, Self::prepare_blur_gles)
+            FrameBlendState::with_sdr(renderer, |renderer| {
+                self.prepare_for(renderer, blur, Self::prepare_blur_gles)
+            })
         } else if renderer.as_vulkan_renderer().is_some() {
             let renderer = renderer.as_vulkan_renderer().unwrap();
             self.prepare_for(renderer, blur, Self::prepare_blur_vulkan)
@@ -252,6 +276,9 @@ impl EffectBuffer {
         LayerSurfaceRenderElement<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("EffectBuffer::prepare_offscreen");
+        if matches!(self.elements, Elements::New(_)) {
+            self.plain_sdr = self.supports_glass();
+        }
 
         // Check if we need to create or recreate the texture.
         let size_string;
