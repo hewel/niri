@@ -1041,6 +1041,8 @@ pub struct BlurPart {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child)]
+    pub liquid_glass: Option<LiquidGlassPart>,
 }
 
 impl MergeWith<BlurPart> for Blur {
@@ -1055,6 +1057,126 @@ impl MergeWith<BlurPart> for Blur {
     }
 }
 
+// Parameters adapted from zaroutt/Niri-glass, commit 72ee16331994b43a9460b713b828a218a023a857.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiquidGlass {
+    pub off: bool,
+    pub refraction_strength: f64,
+    pub power_factor: f64,
+    pub refraction_power: f64,
+    pub glow_weight: f64,
+    pub edge_lighting: f64,
+    pub fringing: f64,
+    pub refraction_dilute: f64,
+    pub dilute_strength: f64,
+    pub dilute_fringing: f64,
+    pub physical_refraction: f64,
+    pub lens_distortion: f64,
+    pub brightness: f64,
+    pub contrast: f64,
+    pub saturation: f64,
+    pub vibrancy: f64,
+    pub adaptive_dim: f64,
+    pub adaptive_boost: f64,
+    pub edge_thickness: f64,
+}
+
+impl Default for LiquidGlass {
+    fn default() -> Self {
+        Self {
+            off: false,
+            refraction_strength: 1.0,
+            power_factor: 3.0,
+            refraction_power: 0.6,
+            glow_weight: 0.08,
+            edge_lighting: 1.0,
+            fringing: 0.3,
+            refraction_dilute: 0.0,
+            dilute_strength: 0.0,
+            dilute_fringing: 0.0,
+            physical_refraction: 0.0,
+            lens_distortion: 0.5,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturation: 0.85,
+            vibrancy: 0.12,
+            adaptive_dim: 0.0,
+            adaptive_boost: 0.0,
+            edge_thickness: 0.15,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct LiquidGlassPart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child, unwrap(argument))]
+    pub refraction_strength: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub power_factor: Option<FloatOrInt<1, 10>>,
+    #[knuffel(child, unwrap(argument))]
+    pub refraction_power: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub glow_weight: Option<FloatOrInt<-100, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub edge_lighting: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub fringing: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub refraction_dilute: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub dilute_strength: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub dilute_fringing: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub physical_refraction: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub lens_distortion: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub brightness: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub contrast: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub saturation: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub vibrancy: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub adaptive_dim: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub adaptive_boost: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub edge_thickness: Option<FloatOrInt<0, 100>>,
+}
+
+impl MergeWith<LiquidGlassPart> for LiquidGlass {
+    fn merge_with(&mut self, part: &LiquidGlassPart) {
+        // As with blur: a later block enables the effect unless it explicitly says off.
+        self.off = part.off.is_some_and(|off| off.0);
+        merge!(
+            (self, part),
+            refraction_strength,
+            power_factor,
+            refraction_power,
+            glow_weight,
+            edge_lighting,
+            fringing,
+            refraction_dilute,
+            dilute_strength,
+            dilute_fringing,
+            physical_refraction,
+            lens_distortion,
+            brightness,
+            contrast,
+            saturation,
+            vibrancy,
+            adaptive_dim,
+            adaptive_boost,
+            edge_thickness,
+        );
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
 pub struct BackgroundEffectRule {
     #[knuffel(child, unwrap(argument))]
@@ -1065,6 +1187,8 @@ pub struct BackgroundEffectRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child)]
+    pub liquid_glass: Option<LiquidGlassPart>,
 }
 
 /// Resolved background effect rule.
@@ -1087,6 +1211,7 @@ pub struct BackgroundEffect {
 
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    pub liquid_glass: Option<LiquidGlass>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
@@ -1100,6 +1225,10 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
         if let Some(x) = part.saturation {
             self.saturation = Some(x.0);
         }
+
+        if let Some(glass) = &part.liquid_glass {
+            self.liquid_glass.get_or_insert_with(LiquidGlass::default).merge_with(glass);
+        }
     }
 }
 
@@ -1109,6 +1238,64 @@ mod tests {
 
     use super::*;
     use crate::Config;
+
+    #[test]
+    fn liquid_glass_rules_merge_and_disable_independently() {
+        let config = Config::parse_mem(r#"
+            window-rule {
+                background-effect {
+                    blur true
+                    liquid-glass {
+                        refraction-strength 3
+                        adaptive-dim 0.2
+                    }
+                }
+            }
+            window-rule {
+                background-effect {
+                    liquid-glass {
+                        saturation 0.9
+                    }
+                }
+            }
+            window-rule {
+                background-effect {
+                    liquid-glass { off; }
+                }
+            }
+            window-rule {
+                background-effect {
+                    liquid-glass {}
+                }
+            }
+        "#).unwrap();
+        let mut effect = BackgroundEffect::default();
+        assert!(effect.liquid_glass.is_none());
+        effect.merge_with(&config.window_rules[0].background_effect);
+        effect.merge_with(&config.window_rules[1].background_effect);
+        let glass = effect.liquid_glass.unwrap();
+        assert_eq!(glass.refraction_strength, 3.);
+        assert_eq!(glass.adaptive_dim, 0.2);
+        assert_eq!(glass.saturation, 0.9);
+        assert_eq!(glass.power_factor, LiquidGlass::default().power_factor);
+        effect.merge_with(&config.window_rules[2].background_effect);
+        assert!(effect.liquid_glass.unwrap().off);
+        assert_eq!(effect.blur, Some(true));
+        effect.merge_with(&config.window_rules[3].background_effect);
+        assert!(!effect.liquid_glass.unwrap().off);
+        assert_eq!(effect.liquid_glass.unwrap().refraction_strength, 3.);
+    }
+
+    #[test]
+    fn liquid_glass_rejects_invalid_parameters() {
+        for parameter in [
+            "refraction-strength -1", "power-factor 0", "adaptive-dim 101",
+            "physical-refraction true", "edge-padding 1", "unknown 1",
+        ] {
+            let source = format!("window-rule {{ background-effect {{ liquid-glass {{ {parameter}; }}; }}; }}");
+            assert!(Config::parse_mem(&source).is_err(), "accepted {parameter}");
+        }
+    }
 
     #[test]
     fn parse_gradient_interpolation() {
