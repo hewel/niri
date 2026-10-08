@@ -91,12 +91,31 @@ Exit with **Super+Shift+E**. Repeat the same command with `examples/personal/hdr
 
 ## Manual observations still required
 
+### Prepared local HDR video acceptance
+
+The user supplied `/home/hewel/Data/jellypilot/test-videos`. The selected HDR10 source is a 3840×2160 HEVC 10-bit episode tagged BT.2020/PQ with mastering metadata (1000 cd/m²), MaxCLL 960 and MaxFALL 803; these describe the video, not the display. Its full path and ffprobe records are retained privately in `validation/hdr-video/`, outside the committed source tree. A separate Dolby Vision profile 8 source was identified but is not the first acceptance fixture.
+
+From TTY 3, use the short entry:
+
+```sh
+cd ~/Codes/niri/personal
+./tty video
+```
+
+The player starts windowed with compositor HDR mode `auto`. Focus the video and press **f** to enter/leave fullscreen. In auto mode, HDR should engage for the fullscreen HDR surface and disengage when returning to the windowed SDR desktop. Press **F1** for always-on HDR, **F2** for auto, **F3** to remove the HDR node and disable it. OSD reports the requested mode; verify the actual mode using the display's menu and the retained compositor log. **Shift+i** shows mpv statistics. Use arrow keys to seek, and **Super+Shift+E** to exit the trial, then **Ctrl+Alt+F2** to return to the original desktop.
+
+Observe natural skin tones, shadows and bright highlights, absence of pink/green casts or washed-out colors, smooth fullscreen transitions and correct desktop/Glass colors after leaving fullscreen. With F1 and a windowed video, check SDR wallpaper Glass on the HDR output as well. Only a human report of the real-display result can satisfy the acceptance gate for daily setup.
+
+Each run creates `validation/hdr-video/tty-*/` with `niri.log`, `mpv.log`, actual player arguments, source metadata, mode requests, player source/target color properties, fullscreen/hardware-decoder/drop-frame state and exit codes. No `--session` is used and the trial runs on a private D-Bus session. The default GLES compositor is retained; mpv itself uses its Wayland Vulkan output with color-management hints. Its user config is bypassed for this controlled check. Relevant primary documentation: [mpv 0.41 stable color hints](https://mpv.io/manual/stable/#options-target-colorspace-hint).
+
+A nested player preflight completed using the chosen video, with 10-bit `rgb10a2`, BT.2020/PQ target readback, hardware decoding and windowed/fullscreen/windowed transitions. The compositor exited with status 0. Evidence: `validation/hdr-video/tty-gkne4xdz/`. That run began at 120 seconds; subsequent trials start at the beginning to support short test clips too. A second preflight verified all three mode keys, watched config reloads, valid player drop-frame properties and player/compositor exit status 0; evidence: `validation/hdr-video/tty-xw7m6lxc/` and `preflight.json`. These verify player integration, not real HDR output; physical video acceptance is pending.
+
 | Scenario | Procedure | Expected observation |
 | --- | --- | --- |
 | Ordinary SDR desktop | Run the SDR example; move/resize windows, open overview and toggle fullscreen | Stable wallpaper/window colors and rounded edges; refraction follows the window rather than drifting with its screen position |
 | Glass disabled | In a trial copy, add `off` to the Glass block and reload; then use `off false` | Ordinary blur remains; enabling Glass adds refraction/tint; disabling it restores ordinary rendering |
 | SDR wallpaper on HDR output | Run the HDR example with the same static background | Glass remains visible; no double conversion, washed-out SDR background, unexplained brightness jump or colored transparent-edge fringe |
-| HDR enable/disable | Compare trial copies with `hdr mode="on"` and `mode="off"` | Display mode transitions complete and both modes render correctly; assess real brightness rather than assuming encoded pixels prove it |
+| HDR enable/disable | Compare trial copies with `hdr mode="on"` and no `hdr` node (this version has no `mode="off"`) | Display mode transitions complete and both modes render correctly; assess real brightness rather than assuming encoded pixels prove it |
 | HDR fullscreen entry/exit | In a trial copy use `mode="auto"`; play a known HDR source in a color-management-capable player/game, enter/leave fullscreen | Correct HDR activation and return to SDR; compositor effects/color conversion remain present when composition is required |
 | Screenshot colors | Capture SDR, HDR-content and wallpaper/Glass scenes with the custom compositor; inspect exported files in a color-aware viewer | Files have the base compositor's intended color representation without unexpected tint/clipping; compare with the unmodified build if uncertain |
 | Screencast colors | Set up the appropriate portal in an isolated test session, select the test output/window, and record SDR and HDR scenes | Captured colors match the base compositor's intended screencast conversion; confirm in a viewer, not just that a stream starts |
