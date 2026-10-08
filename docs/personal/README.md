@@ -111,7 +111,7 @@ The example sets `draw-border-with-background false`: spicy's default filled foc
 
 Do not add `--session` for this independent trial. `Mod+O` toggles overview, `Mod+F` fullscreen and `Mod+Shift+E` exits only the trial compositor. Niri's default `Mod` is Alt in a nested session and Super on the TTY backend. The examples have no desktop autostarts and the SDR example does not enable HDR. Keep experimental changes in copies of these files.
 
-For a real TTY/DRM HDR trial and expected observations, follow [VALIDATION.md](VALIDATION.md). Nested rendering cannot establish physical HDR correctness.
+For a real TTY/DRM HDR trial and expected observations, follow [VALIDATION.md](VALIDATION.md). The console launcher is `./scripts/personal-tty-trial.sh sdr` or `hdr`; this host also provides the short `./tty` link in the `personal/` directory. Nested rendering cannot establish physical HDR correctness.
 
 ## Compare the Glass appearance
 

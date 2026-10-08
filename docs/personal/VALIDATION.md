@@ -62,7 +62,18 @@ The host has AMD Navi 31 and Raphael graphics. The existing desktop ran on VT 2.
 
 ## Real TTY/DRM trial
 
-Save any work in the existing desktop. Press **Ctrl+Alt+F3**, log in, and first run the independent **SDR** example:
+Save any work in the existing desktop. Press **Ctrl+Alt+F3**, log in, and first run the independent **SDR** example. This host has a short local symlink to the versioned launcher:
+
+```sh
+cd ~/Codes/niri/personal
+./tty sdr
+# After exiting the SDR trial:
+./tty hdr
+```
+
+The equivalent portable launcher is `scripts/personal-tty-trial.sh [sdr|hdr]` in the source checkout. It defaults to SDR, refuses to start from a graphical terminal, resolves paths independently of the current directory, and selects the independent artifact or the checkout's release binary. It does not switch VTs or install anything. `hdr` explicitly selects the existing DP-1 HDR example. To create the short link in a freshly prepared sibling layout, run `ln -s niri/scripts/personal-tty-trial.sh tty` from its parent directory.
+
+The expanded SDR command is:
 
 ```sh
 env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NOTIFY_SOCKET \
