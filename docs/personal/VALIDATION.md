@@ -17,7 +17,7 @@ Host inspection (2026-10-08/09, Asia/Shanghai): CachyOS x86_64, kernel 7.2.9-1-c
 | Clippy across workspace/all targets | Completed with five existing warnings, no new Glass warnings | `clippy.log` |
 | Pinned build helper and example parsing | Passed release build and both example validations | `reproduce-build.log` |
 | Independent nested desktop trial | Passed SDR Glass on/off reload, overview/fullscreen and screenshot restoration; final screenshot counts recorded with the trial artifacts | `validation/` |
-| Real TTY trial | Basic operation passed, user-reported; detailed HDR color/display checks pending | User follow-up, 2026-10-09; checklist below |
+| Real TTY HDR10 video trial | Passed user visual checklist; actual HDR signalling and player target readback confirmed | `validation/hdr-video/acceptance.json`; user follow-up, 2026-10-09 |
 
 The final workspace command was:
 
@@ -35,7 +35,7 @@ Initial focused-window captures hid all background effects behind the base's fil
 
 A read-only reviewer inspected the port for renderer and color-path failures; reviewer inspection is not independent test execution. Passing these checks does not establish HDR screenshots, screencasts, direct scanout transitions, perceptual HDR correctness or performance improvements.
 
-User follow-up (2026-10-09): the user reported that the TTY trial had no problems. This records successful basic console operation as human-reported evidence. The report did not specify the active HDR mode or individual checklist observations, so detailed HDR color, fullscreen transition, screenshot and screencast acceptance remains pending. No additional agent-run display test is implied.
+Initial user follow-up (2026-10-09): the user reported that the basic TTY trial had no problems. A later explicit HDR10 video acceptance checked the display's HDR indication, video colors, fullscreen transitions and return to desktop/Glass, and the user replied that it passed. The corresponding real `/dev/tty3` logs were then inspected: DP-1 HDR signalling switched on/off successfully, the player target was 10-bit `rgb10a2` BT.2020/PQ, and both console runs exited with status 0. Evidence is retained in `validation/hdr-video/tty-lnkiauar/`, `tty-qhspa_na/` and `acceptance.json`. This combines human observation with actual DRM-path logs; it is not a measured display calibration or an agent-run physical visual test. Screenshot, screencast and multiple-output acceptance remains pending.
 
 ## SDR appearance follow-up (2026-10-09)
 
@@ -108,7 +108,7 @@ Observe natural skin tones, shadows and bright highlights, absence of pink/green
 
 Each run creates `validation/hdr-video/tty-*/` with `niri.log`, `mpv.log`, actual player arguments, source metadata, mode requests, player source/target color properties, fullscreen/hardware-decoder/drop-frame state and exit codes. No `--session` is used and the trial runs on a private D-Bus session. The default GLES compositor is retained; mpv itself uses its Wayland Vulkan output with color-management hints. Its user config is bypassed for this controlled check. Relevant primary documentation: [mpv 0.41 stable color hints](https://mpv.io/manual/stable/#options-target-colorspace-hint).
 
-A nested player preflight completed using the chosen video, with 10-bit `rgb10a2`, BT.2020/PQ target readback, hardware decoding and windowed/fullscreen/windowed transitions. The compositor exited with status 0. Evidence: `validation/hdr-video/tty-gkne4xdz/`. That run began at 120 seconds; subsequent trials start at the beginning to support short test clips too. A second preflight verified all three mode keys, watched config reloads, valid player drop-frame properties and player/compositor exit status 0; evidence: `validation/hdr-video/tty-xw7m6lxc/` and `preflight.json`. These verify player integration, not real HDR output; physical video acceptance is pending.
+A nested player preflight completed using the chosen video, with 10-bit `rgb10a2`, BT.2020/PQ target readback, hardware decoding and windowed/fullscreen/windowed transitions. The compositor exited with status 0. Evidence: `validation/hdr-video/tty-gkne4xdz/`. That run began at 120 seconds; subsequent trials start at the beginning to support short test clips too. A second preflight verified all three mode keys, watched config reloads, valid player drop-frame properties and player/compositor exit status 0; evidence: `validation/hdr-video/tty-xw7m6lxc/` and `preflight.json`. These nested runs verify player integration. The subsequent real TTY video acceptance and observations are recorded above, separately.
 
 | Scenario | Procedure | Expected observation |
 | --- | --- | --- |
@@ -123,4 +123,4 @@ A nested player preflight completed using the chosen video, with 10-bit `rgb10a2
 | HDR/linear/wide-gamut wallpaper input | Supply a background client declaring those color spaces | Glass is disabled only for the unsupported background with a deduplicated warning; ordinary effects remain |
 | Mixed SDR/HDR outputs | Connect an additional output and move the same window between outputs, including fullscreen transitions | Per-output colors/effects remain correct and no stale cached color-space conversion appears |
 
-The simple demo does not provision a full portal/service environment, generate an HDR video source, or prove screencast correctness. Use known content and a properly configured isolated session for those checks. Detailed checklist results remain pending beyond the user's basic TTY trial report; do not infer them from the nested trial or shader readback.
+The simple demo does not provision a full portal/service environment, generate an HDR video source, or prove screencast correctness. Use known content and a properly configured isolated session for those checks. Beyond the accepted HDR10 video/transition/desktop checks, screenshot, screencast, multiple-output and unsupported-input scenarios remain pending; do not infer them from the video trial, nested rendering or shader readback.

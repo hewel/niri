@@ -25,7 +25,14 @@ if record.get('binary_sha256') != hashlib.sha256(Path(sys.argv[2]).read_bytes())
     raise SystemExit('The accepted binary does not match this artifact; verify the selected build first.')
 PY
 "$trial_binary" validate -c "$daily_stage/config.kdl"
-sudo -v
+if sudo -n true 2>/dev/null; then
+    install_privileges=(sudo -n)
+elif command -v pkexec >/dev/null; then
+    install_privileges=(pkexec)
+else
+    printf 'Administrator authentication is required; run this installer in a terminal with sudo available.\n' >&2
+    exit 1
+fi
 backup=$(mktemp -d "$daily_stage/backup-XXXXXXXX")
 cp -a -- "$HOME/.config/niri" "$backup/original-niri-config"
 for path in "$HOME/.config/niri-personal/config.kdl" \
@@ -38,12 +45,8 @@ for path in "$HOME/.config/niri-personal/config.kdl" \
         cp -a -- "$path" "$backup/previous$path"
     fi
 done
+"${install_privileges[@]}" /usr/bin/bash "$install_source/scripts/personal-install-system.sh"
 mkdir -p -- "$HOME/.config/niri-personal"
 install -m 644 -- "$daily_stage/config.kdl" "$HOME/.config/niri-personal/config.kdl"
-sudo install -Dm755 -- "$trial_binary" /usr/local/lib/niri-personal/niri
-sudo install -Dm755 -- "$install_source/scripts/personal-daily-session.sh" /usr/local/bin/niri-personal-session
-sudo install -Dm644 -- "$install_source/docs/personal/deployment/niri-personal.service" /usr/local/lib/systemd/user/niri-personal.service
-sudo install -Dm644 -- "$install_source/docs/personal/deployment/niri-personal-shutdown.target" /usr/local/lib/systemd/user/niri-personal-shutdown.target
-sudo install -Dm644 -- "$install_source/docs/personal/deployment/niri-personal.desktop" /usr/share/wayland-sessions/niri-personal.desktop
 systemctl --user daemon-reload
 printf 'Installed Niri HDR + Glass. Backup: %s\nChoose it in GDM at your next login; the original Niri entry remains available.\n' "$backup"
