@@ -218,12 +218,14 @@ impl TabIndicator {
                             top_right: radius,
                             bottom_right: 0.,
                             bottom_left: 0.,
+                            smoothing: 0.,
                         },
                         TabIndicatorPosition::Top | TabIndicatorPosition::Bottom => CornerRadius {
                             top_left: radius,
                             top_right: 0.,
                             bottom_right: 0.,
                             bottom_left: radius,
+                            smoothing: 0.,
                         },
                     }
                 } else if tabs_left == 1 {
@@ -234,12 +236,14 @@ impl TabIndicator {
                             top_right: 0.,
                             bottom_right: radius,
                             bottom_left: radius,
+                            smoothing: 0.,
                         },
                         TabIndicatorPosition::Top | TabIndicatorPosition::Bottom => CornerRadius {
                             top_left: 0.,
                             top_right: radius,
                             bottom_right: radius,
                             bottom_left: 0.,
+                            smoothing: 0.,
                         },
                     }
                 } else {

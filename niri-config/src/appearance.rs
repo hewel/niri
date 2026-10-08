@@ -146,6 +146,8 @@ pub struct CornerRadius {
     pub top_right: f32,
     pub bottom_right: f32,
     pub bottom_left: f32,
+    /// Continuous-corner smoothing in [0, 1]; zero retains circular corners.
+    pub smoothing: f32,
 }
 
 impl From<CornerRadius> for [f32; 4] {
@@ -166,6 +168,7 @@ impl From<f32> for CornerRadius {
             top_right: value,
             bottom_right: value,
             bottom_left: value,
+            smoothing: 0.,
         }
     }
 }
@@ -190,7 +193,41 @@ impl CornerRadius {
             top_right: self.top_right * reduction,
             bottom_right: self.bottom_right * reduction,
             bottom_left: self.bottom_left * reduction,
+            smoothing: self.smoothing,
         }
+    }
+
+    /// Distance occupied by each corner along its adjacent edges, in TL, TR, BR, BL order.
+    ///
+    /// Smoothing adds a shoulder beyond the radius. Each corner receives the same proportion
+    /// of the edge as its radius, keeping neighboring shoulders from overlapping after fitting.
+    pub fn extents(self, width: f32, height: f32) -> [f32; 4] {
+        let radii: [f32; 4] = self.into();
+        if self.smoothing == 0. {
+            return radii;
+        }
+
+        let horizontal = [
+            self.top_right,
+            self.top_left,
+            self.bottom_left,
+            self.bottom_right,
+        ];
+        let vertical = [
+            self.bottom_left,
+            self.bottom_right,
+            self.top_right,
+            self.top_left,
+        ];
+        std::array::from_fn(|index| {
+            let radius = radii[index];
+            if radius == 0. {
+                return 0.;
+            }
+            let budget = (width.max(0.) * (radius / (radius + horizontal[index])))
+                .min(height.max(0.) * (radius / (radius + vertical[index])));
+            ((1. + self.smoothing) * radius).min(budget)
+        })
     }
 
     pub fn expanded_by(mut self, width: f32) -> Self {
@@ -224,6 +261,7 @@ impl CornerRadius {
             top_right: self.top_right * scale,
             bottom_right: self.bottom_right * scale,
             bottom_left: self.bottom_left * scale,
+            smoothing: self.smoothing,
         }
     }
 }
@@ -961,6 +999,7 @@ where
             top_right: top_left,
             bottom_right: top_left,
             bottom_left: top_left,
+            smoothing: 0.,
         };
 
         if let Some(val) = iter_args.next() {
@@ -986,13 +1025,18 @@ where
             }
         }
 
-        // Check for unexpected properties and children.
-        for name in node.properties.keys() {
-            ctx.emit_error(DecodeError::unexpected(
-                name,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
+        for (name, value) in &node.properties {
+            if &***name == "smoothing" {
+                rv.smoothing =
+                    <FloatOrInt<0, 1> as knuffel::traits::DecodeScalar<S>>::decode(value, ctx)?.0
+                        as f32;
+            } else {
+                ctx.emit_error(DecodeError::unexpected(
+                    name,
+                    "property",
+                    format!("unexpected property `{}`", name.escape_default()),
+                ));
+            }
         }
         for child in node.children.as_ref().map(|lst| &lst[..]).unwrap_or(&[]) {
             ctx.emit_error(DecodeError::unexpected(
@@ -1239,6 +1283,145 @@ mod tests {
 
     use super::*;
     use crate::Config;
+
+    #[test]
+    fn corner_radius_legacy_and_smoothing_syntax() {
+        let config = Config::parse_mem(
+            r#"
+            window-rule { geometry-corner-radius 20; }
+            window-rule { geometry-corner-radius 10 20 30 40; }
+            window-rule { geometry-corner-radius 20 smoothing=0.65; }
+            window-rule {
+                geometry-corner-radius 10 20 30 40 smoothing=1
+                popups { geometry-corner-radius 8 smoothing=0.4; }
+            }
+            layer-rule { geometry-corner-radius 12 smoothing=0; }
+            "#,
+        )
+        .unwrap();
+        let radii: Vec<_> = config
+            .window_rules
+            .iter()
+            .map(|rule| rule.geometry_corner_radius.unwrap())
+            .collect();
+        assert_eq!(radii[0], CornerRadius::from(20.));
+        assert_eq!(<[f32; 4]>::from(radii[1]), [10., 20., 30., 40.]);
+        assert_eq!(radii[1].smoothing, 0.);
+        assert_eq!(radii[2].smoothing, 0.65);
+        assert_eq!(<[f32; 4]>::from(radii[3]), [10., 20., 30., 40.]);
+        assert_eq!(radii[3].smoothing, 1.);
+        assert_eq!(
+            config.window_rules[3]
+                .popups
+                .geometry_corner_radius
+                .unwrap()
+                .smoothing,
+            0.4
+        );
+        assert_eq!(
+            config.layer_rules[0].geometry_corner_radius.unwrap(),
+            CornerRadius::from(12.)
+        );
+    }
+
+    #[test]
+    fn corner_radius_rejects_invalid_smoothing() {
+        for property in [
+            "smoothing=-0.01",
+            "smoothing=1.01",
+            "smoothing=1e999",
+            "smoothing=-1e999",
+            "smoothing=\"NaN\"",
+            "smoothing=true",
+            "smoothing=null",
+            "smoothing=(float)0.5",
+            "smoothness=0.5",
+        ] {
+            let source = format!("window-rule {{ geometry-corner-radius 20 {property}; }}");
+            assert!(Config::parse_mem(&source).is_err(), "accepted {property}");
+        }
+    }
+
+    #[test]
+    fn corner_radius_rule_override_replaces_smoothing() {
+        use crate::window_rule::ResolvedPopupsRules;
+
+        let config = Config::parse_mem(
+            r#"
+            window-rule { popups { geometry-corner-radius 20 smoothing=0.65; }; }
+            window-rule { popups { opacity 0.8; }; }
+            window-rule { popups { geometry-corner-radius 12; }; }
+            "#,
+        )
+        .unwrap();
+        let mut resolved = ResolvedPopupsRules::default();
+        resolved.merge_with(&config.window_rules[0].popups);
+        resolved.merge_with(&config.window_rules[1].popups);
+        assert_eq!(resolved.geometry_corner_radius.unwrap().smoothing, 0.65);
+        resolved.merge_with(&config.window_rules[2].popups);
+        assert_eq!(
+            resolved.geometry_corner_radius,
+            Some(CornerRadius::from(12.))
+        );
+        assert_eq!(resolved.opacity, Some(0.8));
+    }
+
+    #[test]
+    fn corner_radius_transforms_preserve_smoothing_and_square_corners() {
+        let radius = CornerRadius {
+            top_left: 0.,
+            top_right: 20.,
+            bottom_right: 30.,
+            bottom_left: 10.,
+            smoothing: 0.65,
+        };
+        let transformed = radius.expanded_by(5.).scaled_by(2.).fit_to(70., 80.);
+        assert_eq!(transformed.smoothing, radius.smoothing);
+        assert_eq!(transformed.top_left, 0.);
+        assert!(transformed.top_right + transformed.bottom_right <= 80.);
+        assert_eq!(radius.expanded_by(-40.).smoothing, radius.smoothing);
+        assert_eq!(<[f32; 4]>::from(radius.expanded_by(-40.)), [0.; 4]);
+        assert_eq!(
+            CornerRadius::default().fit_to(0., 0.),
+            CornerRadius::default()
+        );
+    }
+
+    #[test]
+    fn corner_radius_shoulders_fit_asymmetric_and_collapsed_geometry() {
+        let radius = CornerRadius {
+            top_left: 20.,
+            top_right: 40.,
+            bottom_right: 10.,
+            bottom_left: 0.,
+            smoothing: 1.,
+        };
+        // The short top edge is shared in the radii's 1:2 ratio; neither shoulder overlaps.
+        let extents = radius.fit_to(90., 80.).extents(90., 80.);
+        assert_eq!(extents[0], 30.);
+        assert_eq!(extents[1], 60.);
+        assert_eq!(extents[3], 0.);
+
+        for (width, height) in [(90., 80.), (15., 80.), (80., 15.), (0., 80.), (80., 0.)] {
+            let fitted = radius.fit_to(width, height);
+            let [tl, tr, br, bl] = fitted.extents(width, height);
+            assert!([tl, tr, br, bl]
+                .into_iter()
+                .all(|x| x.is_finite() && x >= 0.));
+            assert!(tl + tr <= width + 1e-5);
+            assert!(bl + br <= width + 1e-5);
+            assert!(tl + bl <= height + 1e-5);
+            assert!(tr + br <= height + 1e-5);
+        }
+
+        // Disabling smoothing preserves the old corner footprint exactly.
+        let circular = CornerRadius {
+            smoothing: 0.,
+            ..radius
+        };
+        assert_eq!(circular.extents(90., 80.), <[f32; 4]>::from(circular));
+        assert_eq!(radius.extents(0., 0.), [0.; 4]);
+    }
 
     #[test]
     fn liquid_glass_rules_merge_and_disable_independently() {
