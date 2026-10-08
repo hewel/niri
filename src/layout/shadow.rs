@@ -70,6 +70,11 @@ impl Shadow {
             win_size - Size::from((-spread, -spread)).upscale(2.)
         };
         let radius = win_radius.expanded_by(spread as f32);
+        let radius = if radius.smoothing > 0. {
+            radius.fit_to(box_size.w as f32, box_size.h as f32)
+        } else {
+            radius
+        };
 
         let shader_size = box_size + Size::from((width, width)).upscale(2.);
 
@@ -88,18 +93,13 @@ impl Shadow {
         let window_geo = Rectangle::new(Point::from((0., 0.)), win_size);
 
         if !self.config.draw_behind_window {
-            let top_left = ceil(f64::from(win_radius.top_left));
-            let top_right = f64::min(win_size.w - top_left, ceil(f64::from(win_radius.top_right)));
-            let bottom_left = f64::min(
-                win_size.h - top_left,
-                ceil(f64::from(win_radius.bottom_left)),
-            );
+            let extent = win_radius.extents(win_size.w as f32, win_size.h as f32);
+            let top_left = ceil(f64::from(extent[0]));
+            let top_right = f64::min(win_size.w - top_left, ceil(f64::from(extent[1])));
+            let bottom_left = f64::min(win_size.h - top_left, ceil(f64::from(extent[3])));
             let bottom_right = f64::min(
                 win_size.h - top_right,
-                f64::min(
-                    win_size.w - bottom_left,
-                    ceil(f64::from(win_radius.bottom_right)),
-                ),
+                f64::min(win_size.w - bottom_left, ceil(f64::from(extent[2]))),
             );
 
             let top_left = Rectangle::new(Point::from((0., 0.)), Size::from((top_left, top_left)));

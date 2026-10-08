@@ -163,12 +163,14 @@ impl ShadowRenderElement {
                 mat3_uniform("input_to_geo", input_to_geo),
                 Uniform::new("geo_size", geo_size.to_array()),
                 Uniform::new("corner_radius", <[f32; 4]>::from(corner_radius)),
+                Uniform::new("niri_corner_smoothing", corner_radius.smoothing),
                 mat3_uniform("window_input_to_geo", window_input_to_geo),
                 Uniform::new("window_geo_size", window_geo_size.to_array()),
                 Uniform::new(
                     "window_corner_radius",
                     <[f32; 4]>::from(window_corner_radius),
                 ),
+                Uniform::new("window_corner_smoothing", window_corner_radius.smoothing),
             ]),
             HashMap::new(),
         );

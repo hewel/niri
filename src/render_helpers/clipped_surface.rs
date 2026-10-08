@@ -98,6 +98,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
             Uniform::new("niri_scale", self.scale),
             Uniform::new("geo_size", geo_size),
             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
+            Uniform::new("niri_corner_smoothing", self.corner_radius.smoothing),
             mat3_uniform("input_to_geo", input_to_geo),
         ]
     }
@@ -131,10 +132,9 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         geo: Rectangle<f64, Logical>,
         corner_radius: CornerRadius,
     ) -> [Rectangle<f64, Logical>; 4] {
-        let top_left = corner_radius.top_left as f64;
-        let top_right = corner_radius.top_right as f64;
-        let bottom_right = corner_radius.bottom_right as f64;
-        let bottom_left = corner_radius.bottom_left as f64;
+        let [top_left, top_right, bottom_right, bottom_left] = corner_radius
+            .extents(geo.size.w as f32, geo.size.h as f32)
+            .map(f64::from);
 
         [
             Rectangle::new(geo.loc, Size::from((top_left, top_left))),

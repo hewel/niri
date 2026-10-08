@@ -21,6 +21,7 @@ uniform float tint;
 #endif
 
 uniform float niri_scale;
+uniform float niri_corner_smoothing;
 
 uniform vec2 geo_size;
 uniform vec4 corner_radius;

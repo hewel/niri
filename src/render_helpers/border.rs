@@ -212,6 +212,7 @@ impl BorderRenderElement {
                 mat3_uniform("input_to_geo", input_to_geo),
                 Uniform::new("geo_size", geo_size.to_array()),
                 Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
+                Uniform::new("niri_corner_smoothing", corner_radius.smoothing),
                 Uniform::new("border_width", border_width),
             ]),
             HashMap::new(),

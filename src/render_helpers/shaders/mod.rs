@@ -79,6 +79,7 @@ impl Shaders {
             UniformName::new("niri_scale", UniformType::_1f),
             UniformName::new("geo_size", UniformType::_2f),
             UniformName::new("corner_radius", UniformType::_4f),
+            UniformName::new("niri_corner_smoothing", UniformType::_1f),
             UniformName::new("input_to_geo", UniformType::Matrix3x3),
             UniformName::new("noise", UniformType::_1f),
             UniformName::new("saturation", UniformType::_1f),
@@ -140,6 +141,7 @@ impl Shaders {
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("outer_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("border_width", UniformType::_1f),
             ],
             &[],
@@ -161,9 +163,11 @@ impl Shaders {
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("window_input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("window_geo_size", UniformType::_2f),
                 UniformName::new("window_corner_radius", UniformType::_4f),
+                UniformName::new("window_corner_smoothing", UniformType::_1f),
             ],
             &[],
         )
@@ -184,6 +188,7 @@ impl Shaders {
                     UniformName::new("niri_scale", UniformType::_1f),
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
+                    UniformName::new("niri_corner_smoothing", UniformType::_1f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 ]),
             )
@@ -205,6 +210,7 @@ impl Shaders {
                     UniformName::new("niri_scale", UniformType::_1f),
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
+                    UniformName::new("niri_corner_smoothing", UniformType::_1f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
                     UniformName::new("noise", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
@@ -439,6 +445,7 @@ impl Shaders {
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("outer_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("border_width", UniformType::_1f),
             ],
             &[],
@@ -460,9 +467,11 @@ impl Shaders {
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("window_input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("window_geo_size", UniformType::_2f),
                 UniformName::new("window_corner_radius", UniformType::_4f),
+                UniformName::new("window_corner_smoothing", UniformType::_1f),
             ],
             &[],
         )
@@ -482,6 +491,7 @@ impl Shaders {
                 UniformName::new("niri_scale", UniformType::_1f),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 // The GLES texture shader interface, injected by the renderer per draw.
                 UniformName::new("alpha", UniformType::_1f),
@@ -531,6 +541,7 @@ impl Shaders {
                 UniformName::new("niri_scale", UniformType::_1f),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("corner_radius", UniformType::_4f),
+                UniformName::new("niri_corner_smoothing", UniformType::_1f),
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("noise", UniformType::_1f),
                 UniformName::new("saturation", UniformType::_1f),
@@ -617,7 +628,7 @@ fn assemble_resize_program(src: &str) -> String {
     program
 }
 
-fn resize_uniforms() -> [UniformName<'static>; 10] {
+fn resize_uniforms() -> [UniformName<'static>; 11] {
     [
         UniformName::new("niri_input_to_curr_geo", UniformType::Matrix3x3),
         UniformName::new("niri_curr_geo_to_prev_geo", UniformType::Matrix3x3),
@@ -628,6 +639,7 @@ fn resize_uniforms() -> [UniformName<'static>; 10] {
         UniformName::new("niri_progress", UniformType::_1f),
         UniformName::new("niri_clamped_progress", UniformType::_1f),
         UniformName::new("niri_corner_radius", UniformType::_4f),
+        UniformName::new("niri_corner_smoothing", UniformType::_1f),
         UniformName::new("niri_clip_to_geometry", UniformType::_1f),
     ]
 }
@@ -870,6 +882,7 @@ mod tests {
             UniformName::new("niri_progress", UniformType::_1f),
             UniformName::new("niri_clamped_progress", UniformType::_1f),
             UniformName::new("niri_corner_radius", UniformType::_4f),
+            UniformName::new("niri_corner_smoothing", UniformType::_1f),
             UniformName::new("niri_clip_to_geometry", UniformType::_1f),
         ];
         ShaderProgram::compile_vulkan(

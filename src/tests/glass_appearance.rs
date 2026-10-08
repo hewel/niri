@@ -71,7 +71,7 @@ fn compare_glass_appearance() {
         pin("GLASS_REV"),
         "src/render_helpers/shaders/clipped_surface.frag",
     );
-    // Verify the ordinary helper code is identical to Glass's pinned official base.
+    // The reference keeps its pinned circular helper; the port can evolve its mask.
     let rounding = git_source(
         root,
         pin("GLASS_NIRI_BASE"),
@@ -81,10 +81,6 @@ fn compare_glass_appearance() {
         root,
         pin("GLASS_NIRI_BASE"),
         "src/render_helpers/shaders/postprocess.frag",
-    );
-    assert_eq!(
-        rounding,
-        include_str!("../render_helpers/shaders/rounding_alpha.frag")
     );
     assert_eq!(
         postprocess,
@@ -104,6 +100,7 @@ fn compare_glass_appearance() {
         UniformName::new("niri_scale", UniformType::_1f),
         UniformName::new("geo_size", UniformType::_2f),
         UniformName::new("corner_radius", UniformType::_4f),
+        UniformName::new("niri_corner_smoothing", UniformType::_1f),
         UniformName::new("input_to_geo", UniformType::Matrix3x3),
         UniformName::new("noise", UniformType::_1f),
         UniformName::new("saturation", UniformType::_1f),

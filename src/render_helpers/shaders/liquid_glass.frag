@@ -21,6 +21,7 @@ uniform float tint;
 #endif
 
 uniform float niri_scale;
+uniform float niri_corner_smoothing;
 
 uniform vec2 geo_size;
 uniform vec4 corner_radius;
@@ -89,10 +90,15 @@ struct GlassFragment {
     float ior;
 };
 
-// Rounded-rect SDF -- EXACT copy from kwin
+float niri_rounding_distance(vec2 coords, vec2 size, vec4 radii);
+
+// Circular mode retains the original kwin SDF.
 // cornerRadius: x=bottom-left, y=bottom-right, z=top-left, w=top-right
 float roundedRectangleDist(vec2 p, vec2 b, vec4 cornerRadius)
 {
+    if (niri_corner_smoothing > 0.0)
+        return niri_rounding_distance(p + b, b * 2.0,
+            vec4(cornerRadius.z, cornerRadius.w, cornerRadius.y, cornerRadius.x));
     float r = p.x > 0.0
         ? (p.y > 0.0 ? cornerRadius.y : cornerRadius.w)
         : (p.y > 0.0 ? cornerRadius.x : cornerRadius.z);

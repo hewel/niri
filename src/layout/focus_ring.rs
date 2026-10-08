@@ -122,20 +122,21 @@ impl FocusRing {
         // * At rendering time, tile positions are rounded to physical pixels.
 
         if is_border {
-            let top_left = f64::max(width, ceil(f64::from(radius.top_left)));
+            let extent = radius.extents(self.full_size.w as f32, self.full_size.h as f32);
+            let top_left = f64::max(width, ceil(f64::from(extent[0])));
             let top_right = f64::min(
                 self.full_size.w - top_left,
-                f64::max(width, ceil(f64::from(radius.top_right))),
+                f64::max(width, ceil(f64::from(extent[1]))),
             );
             let bottom_left = f64::min(
                 self.full_size.h - top_left,
-                f64::max(width, ceil(f64::from(radius.bottom_left))),
+                f64::max(width, ceil(f64::from(extent[3]))),
             );
             let bottom_right = f64::min(
                 self.full_size.h - top_right,
                 f64::min(
                     self.full_size.w - bottom_left,
-                    f64::max(width, ceil(f64::from(radius.bottom_right))),
+                    f64::max(width, ceil(f64::from(extent[2]))),
                 ),
             );
 

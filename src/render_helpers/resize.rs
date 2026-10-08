@@ -109,6 +109,7 @@ impl ResizeRenderElement {
                     Uniform::new("niri_progress", progress),
                     Uniform::new("niri_clamped_progress", clamped_progress),
                     Uniform::new("niri_corner_radius", <[f32; 4]>::from(corner_radius)),
+                    Uniform::new("niri_corner_smoothing", corner_radius.smoothing),
                     Uniform::new("niri_clip_to_geometry", clip_to_geometry),
                 ]),
                 HashMap::from([

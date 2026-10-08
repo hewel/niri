@@ -6,6 +6,7 @@ uniform float niri_tint;
 
 uniform float niri_alpha;
 uniform float niri_scale;
+uniform float niri_corner_smoothing;
 
 uniform vec2 niri_size;
 varying vec2 niri_v_coords;

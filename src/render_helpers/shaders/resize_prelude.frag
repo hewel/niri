@@ -26,5 +26,6 @@ uniform float niri_clip_to_geometry;
 
 uniform float niri_alpha;
 uniform float niri_scale;
+uniform float niri_corner_smoothing;
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);

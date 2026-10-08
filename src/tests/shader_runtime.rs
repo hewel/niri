@@ -485,7 +485,7 @@ fn scene_xray_layer_surface_draws_gles() {
         }
 
         window-rule {
-            geometry-corner-radius 12
+            geometry-corner-radius 12 smoothing=0.65
             clip-to-geometry true
             opacity 0.8
             background-effect {
@@ -522,7 +522,7 @@ fn scene_liquid_glass_checks_background_metadata_and_overview() {
         let config = Config::parse_mem(
             r#"
             window-rule {
-                geometry-corner-radius 12
+                geometry-corner-radius 12 smoothing=0.65
                 clip-to-geometry true
                 opacity 0.8
                 background-effect {
@@ -619,7 +619,10 @@ fn border_element() -> BorderRenderElement {
         0.5,
         Rectangle::new(Point::from((10., 10.)), Size::from((180., 180.))),
         4.,
-        CornerRadius::from(8.),
+        CornerRadius {
+            smoothing: 0.65,
+            ..CornerRadius::from(8.)
+        },
         1.,
         1.,
     )
@@ -631,10 +634,16 @@ fn shadow_element() -> ShadowRenderElement {
         Rectangle::new(Point::from((0., 0.)), Size::from((200., 200.))),
         Color::from_rgba8_unpremul(0, 0, 0, 128),
         8.,
-        CornerRadius::from(8.),
+        CornerRadius {
+            smoothing: 0.65,
+            ..CornerRadius::from(8.)
+        },
         1.,
         Rectangle::new(Point::from((10., 10.)), Size::from((180., 180.))),
-        CornerRadius::from(4.),
+        CornerRadius {
+            smoothing: 0.65,
+            ..CornerRadius::from(4.)
+        },
         1.,
     )
 }
@@ -649,7 +658,13 @@ fn framebuffer_effect_element() -> FramebufferEffectElement {
         RenderParams {
             geometry,
             subregion: None,
-            clip: Some((geometry, CornerRadius::from(12.))),
+            clip: Some((
+                geometry,
+                CornerRadius {
+                    smoothing: 0.65,
+                    ..CornerRadius::from(12.)
+                },
+            )),
             scale: 1.,
         },
         Some(BlurOptions {
@@ -701,7 +716,10 @@ fn resize_element(prev: &Offscreen, next: &Offscreen) -> ResizeRenderElement {
         Size::from((100., 100.)),
         0.5,
         0.5,
-        CornerRadius::from(8.),
+        CornerRadius {
+            smoothing: 0.65,
+            ..CornerRadius::from(8.)
+        },
         true,
         1.,
     )
@@ -735,7 +753,7 @@ fn effects_config() -> Config {
         }
 
         window-rule {
-            geometry-corner-radius 12
+            geometry-corner-radius 12 smoothing=0.65
             clip-to-geometry true
             background-effect {
                 blur true
