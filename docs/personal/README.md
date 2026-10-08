@@ -91,7 +91,7 @@ The selected niri and Smithay manifests declare Rust 1.87 as their minimum. The 
 
 The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates both example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
 
-The release binary produced by the helper is `target/release/niri`. The independent trial artifact on this host is `/home/hewel/Codes/niri/personal/artifacts/niri-hdr-glass`. The unmodified debug baseline is retained as `niri-spicy-baseline` beside it.
+The helper explicitly builds into this checkout's `target/`, including when a caller has set `CARGO_TARGET_DIR` or a Cargo target-dir configuration. Its release binary is `target/release/niri`. The independent trial artifact on this host is `/home/hewel/Codes/niri/personal/artifacts/niri-hdr-glass`. The unmodified debug baseline is retained as `niri-spicy-baseline` beside it.
 
 ## Independent trial
 

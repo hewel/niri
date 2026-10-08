@@ -27,6 +27,6 @@ if ! git diff --quiet HEAD; then
     exit 1
 fi
 printf 'niri %s\nSmithay %s\n' "$(git rev-parse HEAD)" "$SMITHAY_REV"
-NIRI_BUILD_COMMIT=$(git rev-parse HEAD) cargo build --release --locked --package niri
+NIRI_BUILD_COMMIT=$(git rev-parse HEAD) cargo build --release --locked --package niri --target-dir "$niri_source/target"
 ./target/release/niri validate -c examples/personal/glass.kdl
 ./target/release/niri validate -c examples/personal/hdr-dp-1.kdl
