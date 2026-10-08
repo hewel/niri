@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Niri HDR + Glass
+Comment=Personal GLES compositor with HDR and SDR wallpaper Glass
+Exec=/usr/local/bin/niri-personal-session
+TryExec=/usr/local/bin/niri-personal-session
+Type=Application
+DesktopNames=niri

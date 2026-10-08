@@ -113,6 +113,8 @@ Do not add `--session` for this independent trial. `Mod+O` toggles overview, `Mo
 
 For a real TTY/DRM HDR trial and expected observations, follow [VALIDATION.md](VALIDATION.md). The console launcher is `./scripts/personal-tty-trial.sh sdr` or `hdr`; this host also provides the short `./tty` link in the `personal/` directory. Nested rendering cannot establish physical HDR correctness.
 
+For the prepared local HDR10 video, run `./tty video` from `personal/` on the TTY. It records player color metadata and compositor HDR transitions for the human acceptance checklist. After that acceptance, [DAILY.md](DAILY.md) describes the staged daily configuration and separate GDM session entry.
+
 ## Compare the Glass appearance
 
 `examples/personal/glass.kdl` uses the selected Niri-glass README's Glass preset. The previous test preset is retained in `glass-test-preset.kdl`. In particular, the aligned preset disables physical refraction, lens distortion and fringing, reduces glow weight to 0.0001, and sets power factor 10, refraction power 1 and vibrancy 0.2. These settings materially change the appearance. Global blur settings remain the trial's three passes and offset 2; the upstream README does not specify those settings.

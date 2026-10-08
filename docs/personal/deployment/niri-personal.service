@@ -1,0 +1,12 @@
+[Unit]
+Description=Personal Niri HDR and Glass session
+BindsTo=graphical-session.target
+Before=graphical-session.target xdg-desktop-autostart.target
+Wants=graphical-session-pre.target xdg-desktop-autostart.target
+After=graphical-session-pre.target
+
+[Service]
+Slice=session.slice
+Type=notify
+UnsetEnvironment=NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY
+ExecStart=/usr/local/lib/niri-personal/niri --session -c %h/.config/niri-personal/config.kdl
