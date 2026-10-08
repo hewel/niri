@@ -17,7 +17,7 @@ Host inspection (2026-10-08/09, Asia/Shanghai): CachyOS x86_64, kernel 7.2.9-1-c
 | Clippy across workspace/all targets | Completed with five existing warnings, no new Glass warnings | `clippy.log` |
 | Pinned build helper and example parsing | Passed release build and both example validations | `reproduce-build.log` |
 | Independent nested desktop trial | Passed SDR Glass on/off reload, overview/fullscreen and screenshot restoration; final screenshot counts recorded with the trial artifacts | `validation/` |
-| Real TTY/DRM HDR output | **Unverified** | Manual steps below |
+| Real TTY trial | Basic operation passed, user-reported; detailed HDR color/display checks pending | User follow-up, 2026-10-09; checklist below |
 
 The final workspace command was:
 
@@ -34,6 +34,8 @@ A separate nested release compositor used its own Wayland/IPC sockets and the GT
 Initial focused-window captures hid all background effects behind the base's filled focus ring. A reviewer traced this existing policy in the tile/focus-ring code; setting `draw-border-with-background false` in the example resolved it without a renderer change. The GTK demo avoids a separate wallpaper tool and terminal dependency. Foot-specific effect behavior was not revalidated after this configuration correction.
 
 A read-only reviewer inspected the port for renderer and color-path failures; reviewer inspection is not independent test execution. Passing these checks does not establish HDR screenshots, screencasts, direct scanout transitions, perceptual HDR correctness or performance improvements.
+
+User follow-up (2026-10-09): the user reported that the TTY trial had no problems. This records successful basic console operation as human-reported evidence. The report did not specify the active HDR mode or individual checklist observations, so detailed HDR color, fullscreen transition, screenshot and screencast acceptance remains pending. No additional agent-run display test is implied.
 
 ## SDR appearance follow-up (2026-10-09)
 
@@ -102,4 +104,4 @@ Exit with **Super+Shift+E**. Repeat the same command with `examples/personal/hdr
 | HDR/linear/wide-gamut wallpaper input | Supply a background client declaring those color spaces | Glass is disabled only for the unsupported background with a deduplicated warning; ordinary effects remain |
 | Mixed SDR/HDR outputs | Connect an additional output and move the same window between outputs, including fullscreen transitions | Per-output colors/effects remain correct and no stale cached color-space conversion appears |
 
-The simple demo does not provision a full portal/service environment, generate an HDR video source, or prove screencast correctness. Use known content and a properly configured isolated session for those checks. The display tests above remain unverified until observed on real hardware; do not infer them from the nested trial or shader readback.
+The simple demo does not provision a full portal/service environment, generate an HDR video source, or prove screencast correctness. Use known content and a properly configured isolated session for those checks. Detailed checklist results remain pending beyond the user's basic TTY trial report; do not infer them from the nested trial or shader readback.
