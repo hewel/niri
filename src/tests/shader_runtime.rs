@@ -476,11 +476,6 @@ fn scene_recent_windows_draws_gles() {
 /// path, which samples the backdrop once instead of the whole framebuffer.
 #[test]
 fn scene_xray_layer_surface_draws_gles() {
-    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
-    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
-
-    use super::client::LayerConfigureProps;
-
     let config = r##"
         layout {
             border {
@@ -503,7 +498,87 @@ fn scene_xray_layer_surface_draws_gles() {
         return;
     };
 
-    // A wallpaper for the xray blur to sample.
+    let _ = add_wallpaper(&mut f);
+
+    add_window(&mut f);
+    settle(&mut f);
+
+    let mut drawn = Vec::new();
+    for blend in [None, HDR_BLEND] {
+        let audit = render_scene(&mut f, blend);
+        audit.assert_drew(&[ProgramType::Border]);
+        drawn.extend(audit.texture_programs);
+    }
+
+    assert!(drawn.contains(&"blur"), "drawn: {drawn:?}");
+    assert!(drawn.contains(&"postprocess_and_clip"), "drawn: {drawn:?}");
+    assert!(drawn.contains(&"clipped_surface"), "drawn: {drawn:?}");
+}
+
+#[test]
+fn scene_liquid_glass_checks_background_metadata_and_overview() {
+    use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{Primaries, RenderIntent, TransferFunction};
+    for hdr_wallpaper in [false, true] {
+        let config = Config::parse_mem(
+            r#"
+            window-rule {
+                geometry-corner-radius 12
+                clip-to-geometry true
+                opacity 0.8
+                background-effect {
+                    xray true
+                    blur true
+                    liquid-glass {}
+                }
+            }
+        "#,
+        )
+        .unwrap();
+        let Some(mut f) = set_up(config) else {
+            return;
+        };
+        let (id, surface) = add_wallpaper(&mut f);
+        if hdr_wallpaper {
+            f.client(id).create_and_attach_hdr_description(
+                &surface,
+                TransferFunction::St2084Pq,
+                Primaries::Bt2020,
+                RenderIntent::Perceptual,
+            );
+            surface.commit();
+            f.double_roundtrip(id);
+        }
+        add_window(&mut f);
+        settle(&mut f);
+        let mut drew_blur = false;
+        for blend in [None, HDR_BLEND] {
+            let audit = render_scene(&mut f, blend);
+            assert_eq!(
+                audit.texture_programs.contains(&"liquid_glass_and_clip"),
+                !hdr_wallpaper,
+                "drawn: {:?}",
+                audit.texture_programs
+            );
+            drew_blur |= audit.texture_programs.contains(&"blur");
+            if hdr_wallpaper {
+                assert!(audit.texture_programs.contains(&"postprocess_and_clip"));
+            }
+        }
+        assert!(drew_blur);
+        // Glass uses the same coordinate transforms and damage in the zoomed overview.
+        f.niri().layout.open_overview();
+        set_time(&mut f, Duration::from_millis(100));
+        let audit = render_scene(&mut f, HDR_BLEND);
+        if !hdr_wallpaper {
+            assert!(audit.texture_programs.contains(&"liquid_glass_and_clip"));
+        }
+    }
+}
+
+fn add_wallpaper(f: &mut Fixture) -> (ClientId, WlSurface) {
+    use super::client::LayerConfigureProps;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
     let id = f.add_client();
     let layer = f
         .client(id)
@@ -523,19 +598,7 @@ fn scene_xray_layer_surface_draws_gles() {
     layer.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    add_window(&mut f);
-    settle(&mut f);
-
-    let mut drawn = Vec::new();
-    for blend in [None, HDR_BLEND] {
-        let audit = render_scene(&mut f, blend);
-        audit.assert_drew(&[ProgramType::Border]);
-        drawn.extend(audit.texture_programs);
-    }
-
-    assert!(drawn.contains(&"blur"), "drawn: {drawn:?}");
-    assert!(drawn.contains(&"postprocess_and_clip"), "drawn: {drawn:?}");
-    assert!(drawn.contains(&"clipped_surface"), "drawn: {drawn:?}");
+    (id, surface)
 }
 
 // =============================================================================

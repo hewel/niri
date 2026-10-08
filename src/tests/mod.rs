@@ -10,6 +10,7 @@ mod color_management;
 mod floating;
 mod fullscreen;
 mod layer_shell;
+mod liquid_glass;
 mod remove_output;
 mod shader_runtime;
 mod suspended;
