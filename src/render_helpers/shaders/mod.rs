@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use glam::Mat3;
 use smithay::backend::renderer::gles::{
@@ -28,6 +28,8 @@ pub struct Shaders {
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<NiriTexProgram>,
     pub postprocess_and_clip: Option<NiriTexProgram>,
+    pub liquid_glass_and_clip: RefCell<Option<NiriTexProgram>>,
+    liquid_glass_compiled: Cell<bool>,
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<NiriTexProgram>,
     pub blur: Option<BlurProgram>,
@@ -58,6 +60,46 @@ fn with_blend_uniform_names(specific: &[UniformName<'static>]) -> Vec<UniformNam
 }
 
 impl Shaders {
+    /// Compile on the first Glass request; disabled configurations allocate no Glass program.
+    pub fn liquid_glass(renderer: &mut impl NiriRenderer) -> Option<NiriTexProgram> {
+        let renderer = renderer.as_gles_renderer()?;
+        let shaders = Self::get(renderer)?;
+        if shaders.liquid_glass_compiled.get() {
+            return shaders.liquid_glass_and_clip.borrow().clone();
+        }
+        let program = Self::compile_glass(renderer);
+        let shaders = Self::get(renderer)?;
+        shaders.liquid_glass_compiled.set(true);
+        *shaders.liquid_glass_and_clip.borrow_mut() = program.clone();
+        program
+    }
+
+    fn compile_glass(renderer: &mut GlesRenderer) -> Option<NiriTexProgram> {
+        let mut names = vec![
+            UniformName::new("niri_scale", UniformType::_1f),
+            UniformName::new("geo_size", UniformType::_2f),
+            UniformName::new("corner_radius", UniformType::_4f),
+            UniformName::new("input_to_geo", UniformType::Matrix3x3),
+            UniformName::new("noise", UniformType::_1f),
+            UniformName::new("saturation", UniformType::_1f),
+            UniformName::new("bg_color", UniformType::_4f),
+        ];
+        names.extend(super::liquid_glass::uniform_names());
+        renderer
+            .compile_custom_texture_shader(
+                concat!(
+                    include_str!("liquid_glass.frag"),
+                    include_str!("rounding_alpha.frag"),
+                    include_str!("postprocess.frag"),
+                    include_str!("hdr.frag"),
+                ),
+                &with_blend_uniform_names(&names),
+            )
+            .map_err(|err| warn!("error compiling liquid glass shader: {err:?}"))
+            .ok()
+            .map(NiriTexProgram::Gles)
+    }
+
     fn compile(renderer: &mut GlesRenderer) -> Self {
         let _span = tracy_client::span!("Shaders::compile");
 
@@ -205,6 +247,8 @@ impl Shaders {
             shadow,
             clipped_surface,
             postprocess_and_clip,
+            liquid_glass_and_clip: RefCell::new(None),
+            liquid_glass_compiled: Cell::new(false),
             resize,
             gradient_fade,
             blur,
@@ -538,6 +582,8 @@ impl Shaders {
             shadow,
             clipped_surface,
             postprocess_and_clip,
+            liquid_glass_and_clip: RefCell::new(None),
+            liquid_glass_compiled: Cell::new(false),
             resize,
             gradient_fade,
             blur: None,
