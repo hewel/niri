@@ -1,0 +1,58 @@
+// Independent SDR trial. Never copied over ~/.config/niri/config.kdl.
+// Launch without --session for a nested window or a non-main TTY trial.
+input {
+    keyboard { xkb { layout "us"; }; }
+}
+hotkey-overlay { skip-at-startup; }
+layout {
+    gaps 20
+    background-color "#29486100"
+    default-column-width { proportion 0.65; }
+    focus-ring { width 2; active-color "#afddec"; }
+}
+blur {
+    passes 3
+    offset 2
+    noise 0
+    saturation 1
+}
+window-rule {
+    match app-id="^personal-glass-demo$"
+    opacity 0.8
+    // The base's default filled focus ring would hide the sampled background.
+    draw-border-with-background false
+    geometry-corner-radius 20
+    clip-to-geometry true
+    background-effect {
+        xray true
+        blur true
+        liquid-glass {
+            refraction-strength 3
+            power-factor 3
+            physical-refraction 1
+            lens-distortion 0.25
+            glow-weight 0.08
+            edge-lighting 0.2
+            fringing 0.2
+            saturation 0.9
+            vibrancy 0.12
+            adaptive-dim 0.2
+            adaptive-boost 0.2
+        }
+    }
+}
+binds {
+    Mod+Return { spawn "foot" "--app-id=personal-glass-demo" "--override=colors-dark.alpha=0.65" "--override=colors-dark.blur=yes"; }
+    Mod+W { close-window; }
+    Mod+F { fullscreen-window; }
+    Mod+O { toggle-overview; }
+    Mod+Shift+E { quit skip-confirmation=true; }
+    Mod+H { focus-column-left; }
+    Mod+L { focus-column-right; }
+    Mod+J { focus-window-down; }
+    Mod+K { focus-window-up; }
+    Mod+Shift+H { move-column-left; }
+    Mod+Shift+L { move-column-right; }
+    Mod+Shift+J { move-window-down; }
+    Mod+Shift+K { move-window-up; }
+}

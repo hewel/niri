@@ -1,0 +1,9 @@
+// Only for a real TTY/DRM test on the locally detected display.
+// DP-1: ViewSonic VG2481-4K. Its EDID declares PQ and a 400 cd/m² peak.
+// No peak override: use the display's own EDID. Recheck connector names on another host.
+include "glass.kdl"
+output "DP-1" {
+    hdr mode="on"
+}
+// Start with glass.kdl (SDR), then explicitly choose this file for always-on HDR.
+// For fullscreen auto switching, change mode="on" to mode="auto" in a trial copy.
