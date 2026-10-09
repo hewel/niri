@@ -221,8 +221,13 @@ void main() {
     if (border_width > 0.0) {
         coords_geo -= vec3(border_width);
         vec2 inner_geo_size = geo_size - vec2(border_width * 2.0);
-        if (0.0 <= coords_geo.x && coords_geo.x <= inner_geo_size.x
-                && 0.0 <= coords_geo.y && coords_geo.y <= inner_geo_size.y)
+        // Smooth inner contours include the pixel footprint just outside the
+        // inset rectangle. A hard bounds test truncates that coverage at
+        // fractional border widths. Keep the original circular-mode behavior.
+        bool smooth_inset = niri_corner_smoothing > 0.0
+            && inner_geo_size.x > 0.0 && inner_geo_size.y > 0.0;
+        if (smooth_inset || (0.0 <= coords_geo.x && coords_geo.x <= inner_geo_size.x
+                && 0.0 <= coords_geo.y && coords_geo.y <= inner_geo_size.y))
         {
             vec4 inner_radius = max(outer_radius - vec4(border_width), 0.0);
             color = color * (1.0 - niri_rounding_alpha(coords_geo.xy, inner_geo_size, inner_radius));

@@ -44,9 +44,9 @@ The existing daily/GDM installation predates this extension. Its earlier validat
 
 ## Validation and acceptance
 
-The independent release artifact was built from `88ff7ceff854562045eed0e849c6890745d15a04` (rendering implementation `ffc387fb4ac7a4a55d3c2402fd94f41f7052996c`). Its SHA256 is `0372bb7c8b5b0fe1d9368b63760b1ffb23de49df32c601513aed88d8e25dc606`. Subsequent helper/documentation commits do not change compositor code. The original accepted daily artifact and installed binary still have SHA256 `a577c86e90d4dda3727d935b70b03ccc8c7c693cbe0a6ee71ad0ea3af7aa386a`.
+The initial independent release artifact was built from `88ff7ceff854562045eed0e849c6890745d15a04` (rendering implementation `ffc387fb4ac7a4a55d3c2402fd94f41f7052996c`). Its SHA256 is `0372bb7c8b5b0fe1d9368b63760b1ffb23de49df32c601513aed88d8e25dc606`. That initial binary is preserved as `artifacts/niri-hdr-glass-smooth-88ff7cef`; the inner-edge correction below changes the compositor, and the current trial binary version/hash is in `artifacts/smooth-corners-build-record.json`. The original accepted daily artifact and installed binary still have SHA256 `a577c86e90d4dda3727d935b70b03ccc8c7c693cbe0a6ee71ad0ea3af7aa386a`.
 
-Fresh validation on this host:
+Initial-version validation on this host:
 
 - `cargo test --locked --workspace`, with `NIRI_TEST_REQUIRE_GPU=1 LIBGL_ALWAYS_SOFTWARE=1`: 283 niri tests, 27 configuration tests, one configuration integration test, two IPC tests and one IPC doctest passed. The manual Glass reference probe was excluded from that command, then executed separately and passed.
 - The renderer checks include actual GLES and Vulkan shader compilation, uniform/texture binding and drawing, including smooth border/shadow, framebuffer clipping, resize and representative custom resize shaders in SDR and HDR blend states. The software GLES pixel probe is distinct from physical HDR display validation.
@@ -60,6 +60,16 @@ Evidence is stored under `/home/hewel/Codes/niri/personal/validation/smooth-corn
 
 Physical TTY/DRM HDR output and human visual acceptance remain **unverified for this new build**. The original [VALIDATION.md](VALIDATION.md) and earlier HDR10 acceptance apply to the previous daily binary. No performance improvement is claimed.
 
+### Inner-edge antialiasing correction
+
+The user subsequently passed the manual trial and reported slight jaggedness on the inside of rounded borders. DP-1's currently observed scale is 1.75. The correction preserves the contour and color conversion, but replaces the smoothed shape's fixed one-physical-pixel smoothstep with analytic coverage of a square pixel against the local boundary normal. This accounts for the wider footprint of diagonal edges. The inset mask is also evaluated immediately outside the inner rectangle, rather than truncating its AA coverage with a hard bounds check. Circular (`smoothing=0`) behavior is unchanged.
+
+A new regression check draws a 2px border with the compositor's 0.5-logical-pixel corner allowance at scale 1.75. Its independent reference uses the unmodified pinned Lisse outer and inner paths, rasterized at 8x then box-filtered. Before the fix the maximum alpha error was 27/255 and full-image mean 0.24048/255, failing the coverage check. After the fix they are 3/255 and 0.0112/255. All 14 reference SVG/PNG/metadata fixtures reproduce exactly; fixture regeneration now additionally requires Python Pillow.
+
+Fresh workspace tests pass with 284 niri tests, 27 configuration tests and the existing integration/IPC checks. Real GLES/Vulkan drawing and SDR/HDR mask consistency remain covered. Independent read-only review found a subpixel-rectangle coverage edge case; exact interval intersection now caps that coverage correctly. The base renderer's existing inner/outer mask composition is retained. No additional captures or rendering passes are introduced.
+
+Evidence for this correction is in `validation/corner-aa/`, including the failing/passing pixel logs, before/after border PNGs, the independent reference and workspace test log. The same `./tty smooth` and `./tty smooth-hdr` commands select the rebuilt independent trial artifact. The installed daily binary and active configuration are preserved. Human confirmation of the corrected inner edge remains pending; the reported acceptance above applies to the initial binary.
+
 To reproduce the pixel/reference checks (Lisse and its JS tooling are required only when regenerating fixtures):
 
 ```sh
@@ -70,7 +80,7 @@ NIRI_TEST_REQUIRE_GPU=1 LIBGL_ALWAYS_SOFTWARE=1 \
 python3 scripts/personal-smooth-trial.py --output-root ../validation/smooth-corners
 ```
 
-The reference helper requires Node, TypeScript (`tsc`, or an explicit `NIRI_TSC` executable), and `rsvg-convert`. It verifies the exact clean Lisse revision before compiling. It never fetches an arbitrary tip. The test PNGs are committed, so ordinary compositor builds/tests do not need that checkout or tooling.
+The reference helper requires Node, TypeScript (`tsc`, or an explicit `NIRI_TSC` executable), `rsvg-convert`, and Python Pillow. It verifies the exact clean Lisse revision before compiling. It never fetches an arbitrary tip. The test PNGs are committed, so ordinary compositor builds/tests do not need that checkout or tooling.
 
 Manual acceptance still needs the following observations:
 

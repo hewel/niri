@@ -327,3 +327,32 @@ fn thick_inner_border_and_oversized_shadow_keep_valid_smooth_geometry() {
         );
     }
 }
+
+#[test]
+fn fractional_border_inner_edge_matches_pixel_area_coverage() {
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+    // A 2px border with the compositor's 0.5px corner bleed allowance,
+    // at the user's fractional output scale. Lisse paths are independently
+    // rasterized at 8x and box-filtered; the inner curve is translated by 2.5px.
+    let actual = pixels(
+        &mut renderer,
+        1.75,
+        &[border(radius([40.; 4], 0.65), 1.75, 2.5)],
+    );
+    let expected = reference(include_bytes!("fixtures/smooth-corners/border-175.png"));
+    record("border-175", 1.75, &actual);
+    let differences: Vec<_> = actual
+        .chunks_exact(4)
+        .zip(expected.chunks_exact(4))
+        .map(|(a, b)| a[3].abs_diff(b[3]))
+        .collect();
+    let max = *differences.iter().max().unwrap();
+    let mean = differences.iter().map(|v| f64::from(*v)).sum::<f64>() / differences.len() as f64;
+    eprintln!("border-175 coverage: max {max}, mean {mean:.4}/255");
+    assert!(
+        max <= 12,
+        "border pixel coverage mismatch: max {max}, mean {mean}"
+    );
+}

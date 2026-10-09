@@ -37,8 +37,9 @@ vec2 niri_corner_bezier(float t, float p, vec4 abcd) {
 // Signed distance to the first cubic shoulder and the neighboring circular arc.
 // Reflection covers the second shoulder. Projection is refined from a coarse
 // closest seed; endpoints also participate so shoulder/arc joins remain closed.
-float niri_smooth_corner_distance(vec2 point, float radius, float budget, float smoothing) {
-    if (point.x < point.y) point = point.yx;
+vec3 niri_smooth_corner_sample(vec2 point, float radius, float budget, float smoothing) {
+    bool reflected = point.x < point.y;
+    if (reflected) point = point.yx;
     float p;
     vec4 k = niri_smooth_corner_params(radius, budget, smoothing, p);
     float t = 0.0;
@@ -78,7 +79,14 @@ float niri_smooth_corner_distance(vec2 point, float radius, float budget, float 
     vec2 arc_point = vec2(radius) - radius * vec2(sin(angle), cos(angle));
     vec2 arc_delta = point - arc_point;
     float arc_distance = length(arc_delta) * (dot(arc_delta, arc_point - vec2(radius)) >= 0.0 ? 1.0 : -1.0);
-    return abs(arc_distance) < abs(signed_distance) ? arc_distance : signed_distance;
+    bool use_arc = abs(arc_distance) < abs(signed_distance);
+    vec2 normal_delta = use_arc ? arc_delta : delta;
+    vec2 normal = length(normal_delta) > 0.000001
+        ? abs(normal_delta) / length(normal_delta)
+        : (use_arc ? vec2(sin(angle), cos(angle))
+                   : abs(vec2(tangent.y, tangent.x)) / max(length(tangent), 0.000001));
+    if (reflected) normal = normal.yx;
+    return vec3(use_arc ? arc_distance : signed_distance, normal);
 }
 
 // Decorations can shrink their geometry after the outer radii were fitted
@@ -92,7 +100,7 @@ vec4 niri_fit_radii(vec2 size, vec4 radii) {
     return radii * max(factor, 0.0);
 }
 
-float niri_smooth_distance(vec2 coords, vec2 size, vec4 radii, float smoothing) {
+vec3 niri_smooth_sample(vec2 coords, vec2 size, vec4 radii, float smoothing) {
     radii = niri_fit_radii(size, radii);
     vec4 budget = vec4(
         niri_corner_budget(size, radii.x, radii.yw),
@@ -103,19 +111,26 @@ float niri_smooth_distance(vec2 coords, vec2 size, vec4 radii, float smoothing) 
     vec2 point;
     float radius;
     float room;
-    if (coords.x < extent.x && coords.y < extent.x) {
+    if (extent.x > 0.0 && coords.x < extent.x && coords.y < extent.x) {
         point = coords; radius = radii.x; room = budget.x;
-    } else if (size.x - coords.x < extent.y && coords.y < extent.y) {
+    } else if (extent.y > 0.0 && size.x - coords.x < extent.y && coords.y < extent.y) {
         point = vec2(size.x - coords.x, coords.y); radius = radii.y; room = budget.y;
-    } else if (size.x - coords.x < extent.z && size.y - coords.y < extent.z) {
+    } else if (extent.z > 0.0 && size.x - coords.x < extent.z && size.y - coords.y < extent.z) {
         point = size - coords; radius = radii.z; room = budget.z;
-    } else if (coords.x < extent.w && size.y - coords.y < extent.w) {
+    } else if (extent.w > 0.0 && coords.x < extent.w && size.y - coords.y < extent.w) {
         point = vec2(coords.x, size.y - coords.y); radius = radii.w; room = budget.w;
     } else {
         vec2 q = abs(coords - size * 0.5) - size * 0.5;
-        return min(max(q.x, q.y), 0.0) + length(max(q, 0.0));
+        vec2 outside = max(q, 0.0);
+        vec2 normal = length(outside) > 0.000001 ? outside / length(outside)
+            : (q.x > q.y ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+        return vec3(min(max(q.x, q.y), 0.0) + length(outside), normal);
     }
-    return niri_smooth_corner_distance(point, radius, room, smoothing);
+    return niri_smooth_corner_sample(point, radius, room, smoothing);
+}
+
+float niri_smooth_distance(vec2 coords, vec2 size, vec4 radii, float smoothing) {
+    return niri_smooth_sample(coords, size, radii, smoothing).x;
 }
 
 // Glass uses the same contour for its refraction normal as for final clipping.
@@ -154,9 +169,31 @@ float niri_circular_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
 float niri_rounding_alpha_for(vec2 coords, vec2 size, vec4 radii, float smoothing) {
     if (smoothing <= 0.0)
         return niri_circular_rounding_alpha(coords, size, radii);
-    float dist = niri_smooth_distance(coords, size, radii, smoothing);
-    float t = clamp(dist * niri_scale + 0.5, 0.0, 1.0);
-    return 1.0 - t * t * (3.0 - 2.0 * t);
+    vec3 shape = niri_smooth_sample(coords, size, radii, smoothing);
+    float dist = shape.x * niri_scale;
+    float a = max(shape.y, shape.z);
+    float b = min(shape.y, shape.z);
+    // Integrate a locally straight boundary over a square physical pixel.
+    // Its projected footprint is the sum of two uniform distributions: a
+    // trapezoid (triangle on a diagonal), rather than a fixed 1px smoothstep.
+    float half_width = (a + b) * 0.5;
+    float plateau = (a - b) * 0.5;
+    float coverage;
+    if (b < 0.00001) {
+        coverage = clamp(0.5 - dist / max(a, 0.00001), 0.0, 1.0);
+    } else if (abs(dist) <= plateau) {
+        coverage = 0.5 - dist / a;
+    } else {
+        float tail = max(half_width - abs(dist), 0.0);
+        float area = tail * tail / (2.0 * a * b);
+        coverage = dist > 0.0 ? area : 1.0 - area;
+    }
+    // Square corners and straight-edge intersections also need the rectangle's
+    // two-dimensional coverage, including the half-pixel outside its bounds.
+    vec2 low = max(vec2(-0.5), -coords * niri_scale);
+    vec2 high = min(vec2(0.5), (size - coords) * niri_scale);
+    vec2 box = clamp(high - low, 0.0, 1.0);
+    return min(coverage, box.x * box.y);
 }
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 radii) {
