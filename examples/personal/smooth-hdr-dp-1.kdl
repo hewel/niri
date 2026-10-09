@@ -1,0 +1,6 @@
+// Explicit real TTY/DRM trial, only for the detected PQ-capable DP-1 display.
+// Use its EDID luminance metadata; there is no peak override.
+include "smooth-corners.kdl"
+output "DP-1" {
+    hdr mode="on"
+}

@@ -21,16 +21,20 @@ def main():
     binary = args.binary.resolve()
     args.output_root.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="smooth-nested-", dir=args.output_root.resolve()))
-    base = (source / "examples/personal/smooth-corners.kdl").read_text().replace('include "glass.kdl"', (source / "examples/personal/glass.kdl").read_text()) + "\nanimations { off; }\n"
+    (output / "glass-base.kdl").write_text((source / "examples/personal/glass.kdl").read_text())
+    base = (source / "examples/personal/smooth-corners.kdl").read_text().replace('include "glass.kdl"', 'include "glass-base.kdl"') + "\nanimations { off; }\n"
     def curve(radii="32", smoothing="0.65"):
         return base + f'\nwindow-rule {{ match app-id="^personal-glass-demo$"; geometry-corner-radius {radii} smoothing={smoothing}; }}\n'
     config = output / "trial.kdl"
-    config.write_text(curve(smoothing="0"))
+    def write_config(text):
+        config.write_text(text)
+        subprocess.run([str(binary), "validate", "-c", str(config)], check=True, capture_output=True, text=True)
+    write_config(curve(smoothing="0"))
     env = os.environ.copy()
     parent_socket = env.pop("NIRI_SOCKET", "")
     env.pop("NOTIFY_SOCKET", None)
     env["NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY"] = "1"
-    env["RUST_LOG"] = "niri=debug"
+    env["RUST_LOG"] = "niri=debug,niri_config=debug"
     log_path = output / "nested.log"
     result = {"binary_version": subprocess.check_output([str(binary), "--version"], text=True).strip()}
     with log_path.open("w") as log:
@@ -80,9 +84,10 @@ def main():
             result["states"] = []
             def capture(name, text=None):
                 if text is not None:
-                    config.write_text(text)
+                    write_config(text)
                     (output / f"{name}.kdl").write_text(text)
                 time.sleep(1.5)
+                assert "error loading config" not in log_path.read_text(), f"Config failed during trial; see {log_path}"
                 screenshot(name)
                 result["states"].append({"name": name, "windows": json.loads(command("--json", "windows"))})
             capture("circular", curve(smoothing="0"))
@@ -106,7 +111,7 @@ def main():
                     raise
             child.wait(timeout=10)
             result["exit_code"] = child.returncode
-            result["config_reload_count"] = log_path.read_text().count("config loaded")
+            result["config_reload_count"] = max(0, log_path.read_text().count(f'loaded config from "{config}"') - 1)
             assert child.returncode == 0
         finally:
             if child.poll() is None:

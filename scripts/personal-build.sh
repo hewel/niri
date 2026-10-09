@@ -32,3 +32,4 @@ NIRI_BUILD_COMMIT=$(git rev-parse HEAD) cargo build --release --locked --package
 ./target/release/niri validate -c examples/personal/glass-test-preset.kdl
 ./target/release/niri validate -c examples/personal/hdr-dp-1.kdl
 ./target/release/niri validate -c examples/personal/smooth-corners.kdl
+./target/release/niri validate -c examples/personal/smooth-hdr-dp-1.kdl
