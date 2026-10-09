@@ -4,6 +4,9 @@ This branch adds GLES Liquid Glass to `losnoco/niri:spicy-main`. Spicy remains t
 
 An optional [smooth-corner extension](SMOOTH-CORNERS.md) adds `geometry-corner-radius 20 smoothing=0.65`, adapting Lisse's Figma squircle corner construction. Omitted or zero smoothing keeps the existing circular corners. Its separate example and `niri-hdr-glass-smooth` artifact are for independent trials; the prepared daily session is not automatically upgraded.
 
+[Architecture and regression checks](ARCHITECTURE.md) describe the daily deployment
+lifecycle, Glass preparation boundary, shared corner contours and refactor evidence.
+
 ## Source boundary
 
 The full source records are also machine-readable in [versions.env](versions.env).
@@ -91,7 +94,7 @@ For another machine, first transfer this repository/branch or a Git bundle prese
 
 The selected niri and Smithay manifests declare Rust 1.87 as their minimum. The locked dependency set was tested with Rust/Cargo 1.98.0 on CachyOS; the minimum toolchain was not tested. Upstream Cargo features are unchanged, including Vulkan support. The build requires a C toolchain, `pkg-config`, Wayland, xkbcommon, libinput, libudev, libseat, EGL/GLES/GBM, libdisplay-info, Pango/Cairo, PipeWire, and Vulkan headers/loader. On this Arch-derived host, libseat is supplied by `seatd`. Check the repository's normal build documentation for package equivalents on other distributions.
 
-The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates all three example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
+The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates all five example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
 
 The helper explicitly builds into this checkout's `target/`, including when a caller has set `CARGO_TARGET_DIR` or a Cargo target-dir configuration. Its release binary is `target/release/niri`. The independent trial artifact on this host is `/home/hewel/Codes/niri/personal/artifacts/niri-hdr-glass`. The unmodified debug baseline is retained as `niri-spicy-baseline` beside it.
 
