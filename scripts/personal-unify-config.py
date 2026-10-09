@@ -172,7 +172,8 @@ def main():
     parser.add_argument("action", choices=("prepare", "apply"))
     parser.add_argument("--config-dir", type=Path, default=Path.home() / ".config/niri")
     parser.add_argument("--stage-dir", type=Path)
-    parser.add_argument("--binary", type=Path, default=Path("/usr/local/lib/niri-personal/niri"))
+    parser.add_argument("--binary", type=Path, required=True,
+                        help="selected accepted executable; do not validate with a stale flat installation")
     args = parser.parse_args()
     config = args.config_dir.resolve()
     stage = args.stage_dir or config / ".pending-personal"

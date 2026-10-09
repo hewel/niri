@@ -9,4 +9,4 @@ After=graphical-session-pre.target
 Slice=session.slice
 Type=notify
 UnsetEnvironment=NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY
-ExecStart=/usr/local/lib/niri-personal/niri --session -c %h/.config/niri/config.kdl
+ExecStart=/usr/local/bin/niri-personal-session --exec

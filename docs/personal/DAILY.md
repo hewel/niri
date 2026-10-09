@@ -1,72 +1,144 @@
 # Daily desktop with the existing niri configuration
 
-The personal session uses `/usr/local/lib/niri-personal/niri` and the single existing
-entry point `~/.config/niri/config.kdl`. There is no active `config-smooth.kdl` or
-separate personal config overlay. Select **Niri HDR + Glass** in GDM at the next
-login. The original binary and session files remain installed.
+The personal session reads the single existing entry point
+`~/.config/niri/config.kdl`. Select **Niri HDR + Glass** in GDM. The system-provided
+Niri binary and session entry remain installed.
 
-The user chose the custom version as the daily default on 2026-10-09. Its accepted
-render build is `0d489c96f6c74b1ad5992a80298eafac3f97ac0e`, SHA-256
+An **accepted build** is tied to the binary's SHA-256 and the user's stated validation
+scope. The **daily build** is selected for the next login; the **running build** can
+remain an older version until logout. The **rollback build** is the preceding accepted
+custom build. An installation or rollback never logs out or restarts the desktop.
+
+The accepted smooth-corner render build is
+`0d489c96f6c74b1ad5992a80298eafac3f97ac0e`, SHA-256
 `b296f3dce6fa779d114058c4be1ba84a0e23a3ac9ed2062e1c24d6b6ca9bbc3b`.
-The corner visual pass authorizes daily use; earlier physical HDR10 acceptance is
-still tied to the earlier build. New-build video, capture and multi-output color
-checks remain separate from corner acceptance.
+Its corner acceptance authorizes daily trial; physical HDR10 acceptance remains tied
+to the earlier build. Acceptance does not extend automatically to later recompilations,
+capture, or multi-output color checks.
 
-Maintain the differences in the existing files:
+## Install, update and retry
+
+From `~/Codes/niri/personal/niri`, select an artifact and its matching acceptance
+record explicitly:
+
+```sh
+scripts/personal-install-daily.sh install \
+    --artifact ../artifacts/niri-hdr-glass-smooth \
+    --acceptance ../validation/corner-aa/daily-acceptance.json
+scripts/personal-install-daily.sh status
+```
+
+Use the same command for the first installation, updates and retries. The old
+`--install`, `--install-smooth` and `--install-unified` modes have been retired.
+There is no implicit build, branch fetch, version selection or config rewrite.
+The command is safe to run while a desktop is active: it validates the selected
+build, publishes its files, and reloads unit metadata for the next login.
+
+Acceptance must contain `result: "passed"`, `source: "user-observed"` and the exact
+`binary_sha256`. Preserve the original description of what the user actually checked;
+never create acceptance by copying a hash from a newer build. The artifact and initial acceptance record are copied together before configuration
+validation, so replacing either caller path cannot change the validated build.
+Authentication occurs only after those staged bytes pass validation; a separately
+passed plan digest binds the privileged copy to that exact prepared selection. A cancelled prompt
+leaves the selection and configuration unchanged; retry the same command.
+
+Daily deployment stores immutable bundles under
+`/usr/local/lib/niri-personal/releases/<bundle-id>/`. A bundle contains the executable,
+session and one-time migration helpers, acceptance record, and content manifest.
+`selection.json` atomically selects the daily and rollback bundles after complete
+copies are verified. A login pins one bundle for migration, validation and compositor
+startup, even if a different build is selected in the meantime. Already executing
+files are not truncated. Old bundles are retained; there is no automatic deletion.
+
+On the first run against the earlier flat installation, its accepted binary is imported
+as a rollback build using the current session helpers. If it differs from the selected
+artifact, supply its actual acceptance record with `--previous-acceptance PATH`.
+An unrecorded installed binary is never silently treated as accepted. If both binaries
+and their bundle files are identical, no redundant rollback copy is invented.
+The earlier flat files are retained for interrupted-bootstrap recovery. A legacy
+wrapper already running during bootstrap has no bundle pin; its eventual service
+handoff uses only the retained flat executable, verified against the accepted SHA
+recorded at import. This narrow compatibility path also checks the retained wrapper
+hash and never substitutes the newly selected build. New logins always pin a bundle.
+An unpinned direct service start without this verified legacy context is refused;
+start daily sessions through the login entry.
+
+The privileged adapter writes only the personal bundle store and these entry files:
+`/usr/local/bin/niri-personal-session`,
+`/usr/local/lib/systemd/user/niri-personal.service`,
+`/usr/local/lib/systemd/user/niri-personal-shutdown.target`, and
+`/usr/share/wayland-sessions/niri-personal.desktop`. It never executes a staged binary
+as root. The ordinary user performs configuration validation.
+
+## Configuration and one-time migration
+
+Maintain personal settings in the existing files:
 
 | File | Custom settings |
 | --- | --- |
-| `cfg/outputs.kdl` | `hdr mode="auto"` inside each existing DP-1 / HDMI-A-1 block; existing modes, scale, position and hot corners retained |
-| `cfg/layout.kdl` | Existing radius 12 gains `smoothing=0.65`; clipping and other layout settings retained |
-| `cfg/rules.kdl` | Existing five blur-only window rule groups gain xray Glass with the accepted preset; Noctalia/anyrun non-xray rules retained |
+| `cfg/outputs.kdl` | `hdr mode="auto"` in the existing DP-1 / HDMI-A-1 blocks; preserve modes, scaling and positions |
+| `cfg/layout.kdl` | Existing radius 12 with `smoothing=0.65` |
+| `cfg/rules.kdl` | Existing five blur-only window groups gain xray Glass; Noctalia/anyrun non-xray effects retained |
 
-There are no duplicated output overrides. Change connector names, resolution,
-scaling and HDR in the same output blocks. Change radius/smoothing in the existing
-global window rule. Change per-application Glass in the existing rules. The root
-config, binds, autostarts, environment, overview and input files are reused verbatim.
+Binary deployment and configuration migration are separate. The existing reviewed
+`~/.config/niri/.pending-personal` directory is preserved. A `prepared` migration is
+validated using its candidate; an `applied` migration validates the live canonical
+config. Updates never copy or apply the pending files again.
 
-Because the original compositor was active during preparation, the three changed
-files are staged in `~/.config/niri/.pending-personal/candidate`. The session wrapper
-applies them once, **after** refusing any running graphical session and **before**
-importing environment or starting the personal service. It validates the candidate,
-checks that the source config has not changed, applies only the three files, and
-validates the result. Failures roll back, and interrupted writes are recovered only
-if the files still contain the known old/new bytes. Later user edits are not reapplied
-or overwritten on subsequent logins. If you edit the base config before the first
-personal login, migration stops with a diagnostic and requires a freshly reviewed
-preparation rather than replacing your edits.
+At login, the selected session helper first refuses a running graphical session.
+Then it applies a prepared migration once, checking the originals and candidate,
+validates the result, and starts the normal niri `--session` integration. Subsequent
+logins leave later user edits intact. If source files were edited after preparation,
+login stops with a diagnostic instead of replacing those edits.
 
-The previous files are retained in `~/.config/niri/.pending-personal/original` and
-`personal/daily/unified/original`. Installation evidence is in
-`personal/daily/unified-installation.json`; older overlay deployment evidence remains
-in `personal/daily/installation.json` and `smooth-installation.json`. Old personal
-config files may remain as inactive backups; the installed service does not read them.
-
-To prepare this host-specific migration from the worktree (explicitly reviewed
-DP-1/HDMI-A-1 blocks, radius 12 and five blur groups):
+For a first migration on this specific host, prepare directly in the canonical config
+folder, before installing:
 
 ```sh
-scripts/personal-unify-config.py prepare --stage-dir ../daily/unified
-scripts/personal-install-daily.sh --install-unified
+scripts/personal-unify-config.py prepare \
+    --binary ../artifacts/niri-hdr-glass-smooth
 ```
 
-An existing stage/pending directory is never overwritten. Preserve it before preparing
-a replacement. This is a one-time config migration, not an unattended updater.
-The installer still verifies the user-observed acceptance hash, checks the copied
-binary again after authentication, backs up installed files, and reloads unit
-metadata without restarting, logging out, or switching desktops. Legacy `--install`
-and `--install-smooth` options are retained for reproducing the earlier staged setups.
+This deliberately checks the reviewed DP-1/HDMI-A-1 blocks, global radius 12 and five
+blur groups; it is not a general KDL migration tool. An existing stage is never
+overwritten. Preserve and inspect any existing pending directory before preparing a
+replacement. Keep `original/` for the system-provided Niri fallback.
 
-The installed service, wrapper and separate binary retain normal niri `--session`,
-notify, portal and autostart integration. The wrapper refuses an active graphical
-session before making config or user-manager changes. A first GDM launch with the
-unified config remains a user-operated check; no desktop is launched by validation.
+If preparation itself failed before producing `manifest.json`, preserve that incomplete
+directory elsewhere and prepare again. If a manifest says `applying`, retry a personal
+login from the login screen: the helper recovers an interrupted write only when files
+still contain its known old/new bytes. If subsequent user edits exist, it stops and
+requires manual reconciliation with `original/` and `candidate/`. Updates refuse an
+unresolved `applying` state; they do not guess how to recover configuration.
 
-## Returning to the original binary
+Historical configuration/deployment evidence remains under `personal/daily/`, including
+`unified-installation.json`, `installation.json` and `smooth-installation.json`.
+Inactive old overlays may remain as backups; the selected session does not read them.
 
-The original `/usr/bin/niri` does not parse `hdr`, `liquid-glass` or `smoothing`.
-Selecting **Niri** requires restoring compatible config first. After daily use,
-back up any newer changes, then restore the three original files:
+## Roll back an accepted custom build
+
+```sh
+scripts/personal-install-daily.sh rollback
+```
+
+This validates the rollback executable against the current config (or the still
+prepared migration candidate), then selects it for the next login. It preserves all
+current configuration files. If the older build cannot read them, selection is refused:
+review the diagnostic and make a deliberate compatible configuration edit, or retain
+the current build. No saved configuration is restored automatically. Repeating rollback
+switches between the last two selections.
+
+If publishing was interrupted, rerun the original install command. Complete bundles
+are reused and verified, incomplete copies are removed under the deployment lock, and
+a changed selection causes a clear retry diagnostic. A failure of `daemon-reload`
+occurs after selection; rerun installation to retry metadata reload without losing the
+rollback selection. No service is automatically started or restarted.
+
+## Returning to the system-provided Niri
+
+The original `/usr/bin/niri` cannot parse `hdr`, `liquid-glass` or `smoothing`.
+This is a separate fallback from the accepted custom rollback. After backing up newer
+edits, restore or manually merge the three original files before selecting **Niri**:
 
 ```sh
 cd ~/.config/niri
@@ -78,7 +150,17 @@ done
 /usr/bin/niri validate -c config.kdl
 ```
 
-Then log out and select **Niri**. Other config files are retained. If you have edited
-these three files during daily use, merge those edits from the rollback backup after
-removing only the unsupported custom settings. The completed migration remains
-marked applied, so subsequent personal logins do not silently restore custom settings.
+Merge newer edits from the backup while removing unsupported custom settings.
+The completed migration remains marked applied, so a later personal login does not
+silently restore custom settings.
+
+## Validation
+
+Run `python3 scripts/test-personal-deploy.py`. It exercises initial installation,
+accepted updates, repeated retries, privilege failure, importing the old flat layout,
+interrupted publication, stale selection, staged-content or plan tampering, caller-path replacement during validation, legacy
+login handoff during bootstrap, config preservation
+and incompatible rollback through the deployment module using temporary filesystems.
+The prior ten migration recovery/edit-preservation cases are now reproducible in this
+same tracked suite. Tests do not request root or install session files. Real GDM login
+and policy authentication remain separate host checks.
