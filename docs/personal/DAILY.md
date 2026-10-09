@@ -26,3 +26,51 @@ After the first personal login, verify Noctalia, wallpaper, application shortcut
 Preparation checks passed: candidate config parsing, shell syntax, refusal of the running original graphical session without environment import, and installer refusal before any write when acceptance is absent. A read-only reviewer identified the output first-match requirement and the autostart target ordering; both were addressed. `systemd-analyze --user verify` passed both on staged-path copies and on the exact installed paths after installation. The installed binary SHA-256 matches the accepted artifact; 13 original binary/session/config files retained their hashes. Stock `niri.service` remained active and `niri-personal.service` inactive. No service was started or stopped by these checks.
 
 The original configuration backup is `/home/hewel/Codes/niri/personal/daily/backup-U4qvxm5O/original-niri-config`. To return to stock behavior, select **Niri** in GDM; there is no original configuration change to undo.
+
+## Accepted smooth-corner daily upgrade
+
+On 2026-10-09 the user accepted the corrected smooth-corner build
+`0d489c96f6c74b1ad5992a80298eafac3f97ac0e` for daily trial. Its SHA-256 is
+`b296f3dce6fa779d114058c4be1ba84a0e23a3ac9ed2062e1c24d6b6ca9bbc3b`.
+This is visual corner acceptance; the earlier real HDR10 acceptance remains tied
+to its original binary. New-build HDR video, capture and multiple-output color
+acceptance are not inferred from the corner pass.
+
+The explicit upgrade command is `scripts/personal-install-daily.sh --install-smooth`.
+It requires the matching user-observed record in
+`personal/validation/corner-aa/daily-acceptance.json`, validates the candidate, and
+refuses an active personal service. The binary is replaced by renaming a new inode.
+The service is switched to `~/.config/niri-personal/config-smooth.kdl` for the next
+login; this overlay includes the existing `config.kdl`, so its current double-output
+layout and locally maintained rules remain live. Neither the base personal config
+nor the original Niri config is rewritten. The overlay sets window radius **12**
+and `smoothing=0.65`, retaining the host's existing radius rather than the demo's 32.
+Edit this independent overlay to change the daily window radius or smoothing.
+
+Generate the staged overlay before installation:
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+template = Path('examples/personal/daily-smooth.kdl.in').read_text()
+config = str(Path.home() / '.config/niri-personal/config.kdl')
+Path('../daily/config-smooth.kdl').write_text(template.replace('@PERSONAL_CONFIG@', json.dumps(config)))
+PY
+scripts/personal-install-daily.sh --install-smooth
+```
+
+Installation evidence is recorded separately in `personal/daily/smooth-installation.json`.
+The upgrade was installed successfully: the installed binary matches the accepted
+hash, its installed overlay parses, and `systemd-analyze --user verify` passes.
+Seventeen original/base personal files retained their hashes; the original service
+stayed active and the personal service inactive. Missing acceptance, mismatched
+artifact and active personal session preflights refused before writes. An independent
+source review checked executable replacement, old-config isolation and copied-byte
+hash validation. These checks do not start a desktop or stand in for daily use.
+The installer prints the backup directory containing the prior personal binary,
+configuration and session files. Choose **Niri HDR + Glass** on the next GDM login.
+No automatic logout or service restart occurs. The original **Niri** login remains
+the immediate fallback. During daily use check the existing HDR video again, move
+windows between the two outputs, and check screenshot/screencast colors; these are
+distinct from the accepted corner appearance and automated rendering checks.

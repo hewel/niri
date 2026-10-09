@@ -1,0 +1,8 @@
+// Keep the existing personal HDR/Glass desktop and its locally maintained outputs.
+include @PERSONAL_CONFIG@
+
+// This host uses radius 12 for windows. Keep that size; smooth the shoulders.
+window-rule {
+    geometry-corner-radius 12 smoothing=0.65
+    clip-to-geometry true
+}
