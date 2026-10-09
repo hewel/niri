@@ -100,14 +100,60 @@ vec4 niri_fit_radii(vec2 size, vec4 radii) {
     return radii * max(factor, 0.0);
 }
 
-vec3 niri_smooth_sample(vec2 coords, vec2 size, vec4 radii, float smoothing) {
+// Prepare once when sampling several rows of the same contour, as shadows do.
+void niri_smooth_contour(vec2 size, inout vec4 radii, float smoothing,
+                         out vec4 budget, out vec4 extent) {
     radii = niri_fit_radii(size, radii);
-    vec4 budget = vec4(
+    budget = vec4(
         niri_corner_budget(size, radii.x, radii.yw),
         niri_corner_budget(size, radii.y, radii.xz),
         niri_corner_budget(size, radii.z, radii.wy),
         niri_corner_budget(size, radii.w, radii.zx));
-    vec4 extent = min((1.0 + smoothing) * radii, budget);
+    extent = min((1.0 + smoothing) * radii, budget);
+}
+
+// Horizontal boundary of the same cubic/arc contour used for clipping.
+float niri_smooth_corner_x(float y, float radius, float budget, float smoothing) {
+    if (radius <= 0.0) return 0.0;
+    float p;
+    vec4 k = niri_smooth_corner_params(radius, budget, smoothing, p);
+    if (y >= p) return 0.0;
+    if (y < k.w && k.w > 0.0) {
+        float t = pow(max(y, 0.0) / k.w, 1.0 / 3.0);
+        return niri_corner_bezier(t, p, k).x;
+    }
+    float arc_end = p - k.x - k.y - k.z;
+    if (y <= arc_end) {
+        float dy = radius - y;
+        return radius - sqrt(max(0.0, radius * radius - dy * dy));
+    }
+    // The reflected shoulder's y is the first shoulder's monotonically
+    // decreasing x. Bisection is bounded and also handles constrained budgets.
+    float lo = 0.0;
+    float hi = 1.0;
+    for (int i = 0; i < 16; i++) {
+        float t = (lo + hi) * 0.5;
+        if (niri_corner_bezier(t, p, k).x > y) lo = t; else hi = t;
+    }
+    return niri_corner_bezier((lo + hi) * 0.5, p, k).y;
+}
+
+// Left/right extent of an interior row, using the prepared fitted contour.
+vec2 niri_smooth_row(float y, vec2 size, vec4 radii, float smoothing,
+                     vec4 budget, vec4 extent) {
+    float left = 0.0;
+    float right = size.x;
+    if (y < extent.x) left = niri_smooth_corner_x(y, radii.x, budget.x, smoothing);
+    else if (size.y - y < extent.w) left = niri_smooth_corner_x(size.y - y, radii.w, budget.w, smoothing);
+    if (y < extent.y) right -= niri_smooth_corner_x(y, radii.y, budget.y, smoothing);
+    else if (size.y - y < extent.z) right -= niri_smooth_corner_x(size.y - y, radii.z, budget.z, smoothing);
+    return vec2(left, right);
+}
+
+vec3 niri_smooth_sample(vec2 coords, vec2 size, vec4 radii, float smoothing) {
+    vec4 budget;
+    vec4 extent;
+    niri_smooth_contour(size, radii, smoothing, budget, extent);
     vec2 point;
     float radius;
     float room;

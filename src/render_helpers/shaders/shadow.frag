@@ -76,46 +76,16 @@ float roundedBoxShadow(vec2 lower, vec2 upper, vec2 point, float sigma, float co
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 float niri_rounding_alpha_for(vec2 coords, vec2 size, vec4 radii, float smoothing);
-vec4 niri_smooth_corner_params(float radius, float budget, float smoothing, out float p);
-vec2 niri_corner_bezier(float t, float p, vec4 abcd);
-float niri_corner_budget(vec2 size, float radius, vec2 adjacent);
-vec4 niri_fit_radii(vec2 size, vec4 radii);
+void niri_smooth_contour(vec2 size, inout vec4 radii, float smoothing,
+                         out vec4 budget, out vec4 extent);
+vec2 niri_smooth_row(float y, vec2 size, vec4 radii, float smoothing,
+                     vec4 budget, vec4 extent);
 
-// Horizontal boundary of the same cubic/arc contour used for clipping. Integrate
-// x analytically, then sample y with the base shader's four Gaussian samples.
-float smoothCornerX(float y, float radius, float budget) {
-    if (radius <= 0.0) return 0.0;
-    float p;
-    vec4 k = niri_smooth_corner_params(radius, budget, niri_corner_smoothing, p);
-    if (y >= p) return 0.0;
-    if (y < k.w && k.w > 0.0) {
-        float t = pow(max(y, 0.0) / k.w, 1.0 / 3.0);
-        return niri_corner_bezier(t, p, k).x;
-    }
-    float arc_end = p - k.x - k.y - k.z;
-    if (y <= arc_end) {
-        float dy = radius - y;
-        return radius - sqrt(max(0.0, radius * radius - dy * dy));
-    }
-    // The reflected shoulder's y is the first shoulder's monotonically
-    // decreasing x. Bisection is bounded and also handles constrained budgets.
-    float lo = 0.0;
-    float hi = 1.0;
-    for (int i = 0; i < 16; i++) {
-        float t = (lo + hi) * 0.5;
-        if (niri_corner_bezier(t, p, k).x > y) lo = t; else hi = t;
-    }
-    return niri_corner_bezier((lo + hi) * 0.5, p, k).y;
-}
-
+// Integrate each contour row analytically along x, with four Gaussian y samples.
 float smoothBoxShadow(vec2 point, vec2 size, float sigma, vec4 radii) {
-    radii = niri_fit_radii(size, radii);
-    vec4 budget = vec4(
-        niri_corner_budget(size, radii.x, radii.yw),
-        niri_corner_budget(size, radii.y, radii.xz),
-        niri_corner_budget(size, radii.z, radii.wy),
-        niri_corner_budget(size, radii.w, radii.zx));
-    vec4 extent = min((1.0 + niri_corner_smoothing) * radii, budget);
+    vec4 budget;
+    vec4 extent;
+    niri_smooth_contour(size, radii, niri_corner_smoothing, budget, extent);
     float start = clamp(-3.0 * sigma, point.y - size.y, point.y);
     float end = clamp(3.0 * sigma, point.y - size.y, point.y);
     float step = (end - start) * 0.25;
@@ -123,13 +93,8 @@ float smoothBoxShadow(vec2 point, vec2 size, float sigma, vec4 radii) {
     for (int i = 0; i < 4; i++) {
         float sample_y = start + (float(i) + 0.5) * step;
         float y = point.y - sample_y;
-        float left = 0.0;
-        float right = size.x;
-        if (y < extent.x) left = smoothCornerX(y, radii.x, budget.x);
-        else if (size.y - y < extent.w) left = smoothCornerX(size.y - y, radii.w, budget.w);
-        if (y < extent.y) right -= smoothCornerX(y, radii.y, budget.y);
-        else if (size.y - y < extent.z) right -= smoothCornerX(size.y - y, radii.z, budget.z);
-        vec2 integral = 0.5 + 0.5 * erf((vec2(right, left) - point.x) * (sqrt(0.5) / sigma));
+        vec2 row = niri_smooth_row(y, size, radii, niri_corner_smoothing, budget, extent);
+        vec2 integral = 0.5 + 0.5 * erf((row.yx - point.x) * (sqrt(0.5) / sigma));
         value += (integral.x - integral.y) * gaussian(sample_y, sigma) * step;
     }
     return value;

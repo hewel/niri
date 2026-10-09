@@ -1,0 +1,57 @@
+{
+  "kind": "Accepted-rendering regression reference, not an independent Gaussian ground truth",
+  "render_commit": "0d489c96f6c74b1ad5992a80298eafac3f97ac0e",
+  "source_head_at_capture": "a19074380b26899b67e8c9dbcc22aa315a3fdea4",
+  "renderer": "GLES via surfaceless EGL with LIBGL_ALWAYS_SOFTWARE=1",
+  "capture": "soft_shadow_contours_match_accepted_rendering, recorded before contour extraction",
+  "geometry": [
+    240,
+    160
+  ],
+  "scale": 1.75,
+  "smoothing": 0.65,
+  "shadow_rgba": [
+    255,
+    255,
+    255,
+    255
+  ],
+  "radii": {
+    "uniform": [
+      40,
+      40,
+      40,
+      40
+    ],
+    "asymmetric": [
+      60,
+      12,
+      0,
+      28
+    ],
+    "fitted": [
+      200,
+      0,
+      0,
+      0
+    ]
+  },
+  "sigmas": [
+    4,
+    16
+  ],
+  "window_cutout": false,
+  "output_blend": "SDR",
+  "reference_shader_sha256": {
+    "shadow.frag": "99e51cf6bbc9b977c8101f6579a3fb04c069ddfc8488e63493cc88faa742c0ca",
+    "rounding_alpha.frag": "cf3c72e66c9923fd85a187075d77171e7e9c9f1dd8f7fe6af79cec493c29f605"
+  },
+  "png_sha256": {
+    "shadow-asymmetric-16.png": "1e24cdad86d85e1e6df3bab95a08aa40fda505863c30c13631827047cec8fe79",
+    "shadow-asymmetric-4.png": "d9aa7b0b4c1853b50fcd9298cbbc8b8143ad803da0589f62f0757f2b01f69f22",
+    "shadow-fitted-16.png": "281bba004f0bb623c0944b2f4e4474f06efb0d1355793d2c294a827d0bdf616e",
+    "shadow-fitted-4.png": "3cef3a14905fe0709f2c1191197843f865e991b90cb5c787af3215146ee32701",
+    "shadow-uniform-16.png": "9a9a2dd6b3dea174006cc6e672a9392d9f6394c33765c57abe7d6740554b7d4b",
+    "shadow-uniform-4.png": "2ed57f3f8e36c6391f6a4feba958c533a39eb551f15bf118d5445e3b30ab76c4"
+  }
+}
