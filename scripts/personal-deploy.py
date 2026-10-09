@@ -48,8 +48,17 @@ def key(value):
 
 def acceptance(path, binary):
     record = read_json(path)
-    if record.get("result") != "passed" or record.get("source") != "user-observed":
-        raise DeploymentError("A recorded user-observed acceptance is required.")
+    observed = record.get("result") == "passed" and record.get("source") == "user-observed"
+    authorized = (
+        record.get("result") == "approved-for-daily-trial"
+        and record.get("source") == "user-authorized"
+        and isinstance(record.get("user_request"), str)
+        and bool(record["user_request"].strip())
+        and isinstance(record.get("scope"), str)
+        and bool(record["scope"].strip())
+    )
+    if not (observed or authorized):
+        raise DeploymentError("Recorded user-observed acceptance or explicit user authorization is required.")
     if record.get("binary_sha256") != digest(binary):
         raise DeploymentError("The artifact does not match the accepted SHA-256; verify this build first.")
     return record
@@ -147,6 +156,7 @@ class Deployment:
                 continue
             record = read_json(self.paths.bundle(identifier) / "acceptance.json")
             builds[role] = {"bundle": identifier, "binary_sha256": record["binary_sha256"],
+                            "source": record["source"], "result": record["result"],
                             "accepted_scope": record.get("scope")}
         return {"layout": "immutable-bundles", "selection": builds}
 

@@ -34,9 +34,14 @@ There is no implicit build, branch fetch, version selection or config rewrite.
 The command is safe to run while a desktop is active: it validates the selected
 build, publishes its files, and reloads unit metadata for the next login.
 
-Acceptance must contain `result: "passed"`, `source: "user-observed"` and the exact
-`binary_sha256`. Preserve the original description of what the user actually checked;
-never create acceptance by copying a hash from a newer build. The artifact and initial acceptance record are copied together before configuration
+Observed acceptance contains `result: "passed"`, `source: "user-observed"` and the exact
+`binary_sha256`. If the user explicitly requests installing a candidate before human
+validation, record `result: "approved-for-daily-trial"`, `source: "user-authorized"`,
+the exact `binary_sha256`, their `user_request`, and a `scope` distinguishing completed
+checks from unverified ones. This requires an actual user instruction; automated
+checks alone never authorize installation. Status preserves this distinction.
+Never relabel authorization as observed success or copy acceptance to a newer hash.
+The artifact and initial acceptance record are copied together before configuration
 validation, so replacing either caller path cannot change the validated build.
 Authentication occurs only after those staged bytes pass validation; a separately
 passed plan digest binds the privileged copy to that exact prepared selection. A cancelled prompt

@@ -6,6 +6,7 @@ Terms for choosing and using the personal niri build alongside its existing desk
 
 **Accepted build**:
 A personal niri build confirmed by the user within a stated validation scope. Acceptance of corner appearance does not imply acceptance of HDR output or screen capture.
+An explicit user instruction can also approve a build for daily trial before human validation; its record must distinguish authorization from observed success.
 
 **Running build**:
 The niri build used by the current desktop session. It can differ from the build selected for the next login.

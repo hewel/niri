@@ -148,6 +148,36 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotEqual(identifier, previous)
         self.assertEqual(d.digest(self.paths.bundle(previous) / "niri"), d.digest(old))
 
+    def test_explicit_daily_trial_authorization_preserves_evidence_and_rollback(self):
+        old = self.install("observed")
+        binary, accepted = self.artifact("authorized")
+        record = d.read_json(accepted)
+        record.update(source="user-authorized", result="approved-for-daily-trial",
+                      user_request="Install the latest version",
+                      scope="Daily trial requested; physical HDR remains unverified.")
+        d.write_json(accepted, record)
+        identifier = self.deploy.install(binary, accepted)
+        self.assertEqual(d.read_json(self.paths.bundle(identifier) / "acceptance.json"), record)
+        status = self.deploy.status()["selection"]
+        self.assertEqual(status["current"]["source"], "user-authorized")
+        self.assertEqual(status["current"]["result"], "approved-for-daily-trial")
+        self.assertEqual(status["previous"]["source"], "user-observed")
+        self.assertEqual(self.deploy.rollback(), old)
+
+    def test_daily_trial_authorization_still_requires_request_scope_and_matching_bytes(self):
+        binary, accepted = self.artifact("authorized")
+        record = d.read_json(accepted)
+        record.update(source="user-authorized", result="approved-for-daily-trial",
+                      user_request="Install", scope="Daily trial, HDR unverified")
+        for invalid in [dict(record, user_request=" "), dict(record, scope=None),
+                        dict(record, source="automated"), dict(record, result="passed"),
+                        dict(record, binary_sha256="0" * 64)]:
+            with self.subTest(record=invalid):
+                d.write_json(accepted, invalid)
+                with self.assertRaises(d.DeploymentError):
+                    self.deploy.install(binary, accepted)
+                self.assertIsNone(self.paths.selected())
+
     def test_interrupted_publication_leaves_selection_and_retries(self):
         one = self.install("one")
         two = self.artifact("two")
