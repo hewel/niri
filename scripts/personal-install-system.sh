@@ -8,8 +8,9 @@ fi
 system_script=$(readlink -f -- "${BASH_SOURCE[0]}")
 system_source=$(cd -- "$(dirname -- "$system_script")/.." && pwd)
 case ${1:-} in
-    --install) binary="$system_source/../artifacts/niri-hdr-glass"; config_name=config.kdl ;;
-    --install-smooth) binary="$system_source/../artifacts/niri-hdr-glass-smooth"; config_name=config-smooth.kdl ;;
+    --install) binary="$system_source/../artifacts/niri-hdr-glass"; config_path=%h/.config/niri-personal/config.kdl ;;
+    --install-smooth) binary="$system_source/../artifacts/niri-hdr-glass-smooth"; config_path=%h/.config/niri-personal/config-smooth.kdl ;;
+    --install-unified) binary="$system_source/../artifacts/niri-hdr-glass-smooth"; config_path=%h/.config/niri/config.kdl ;;
     *) printf 'An explicit daily build selection is required.\n' >&2; exit 1 ;;
 esac
 if [[ $# != 2 || ! $2 =~ ^[0-9a-f]{64}$ ]]; then
@@ -31,7 +32,8 @@ if [[ $copied_sha != "$accepted_sha" ]]; then
 fi
 mv -f -- "$binary_temp" /usr/local/lib/niri-personal/niri
 install -Dm755 -- "$system_source/scripts/personal-daily-session.sh" /usr/local/bin/niri-personal-session
-sed "s@%h/.config/niri-personal/config.kdl@%h/.config/niri-personal/$config_name@" \
+install -Dm755 -- "$system_source/scripts/personal-unify-config.py" /usr/local/lib/niri-personal/unify-config.py
+sed "s@%h/.config/niri/config.kdl@$config_path@" \
     "$system_source/docs/personal/deployment/niri-personal.service" > "$service_temp"
 install -Dm644 -- "$service_temp" /usr/local/lib/systemd/user/niri-personal.service
 install -Dm644 -- "$system_source/docs/personal/deployment/niri-personal-shutdown.target" /usr/local/lib/systemd/user/niri-personal-shutdown.target

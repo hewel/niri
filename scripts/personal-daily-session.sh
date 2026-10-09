@@ -16,10 +16,12 @@ if [[ ${1:-} == --check ]]; then
     printf 'No conflicting graphical session.\n'
     exit 0
 fi
-if [[ ! -f "$HOME/.config/niri-personal/config.kdl" ]]; then
-    printf 'Missing personal configuration: %s\n' "$HOME/.config/niri-personal/config.kdl" >&2
+python3 /usr/local/lib/niri-personal/unify-config.py apply
+if [[ ! -f "$HOME/.config/niri/config.kdl" ]]; then
+    printf 'Missing configuration: %s\n' "$HOME/.config/niri/config.kdl" >&2
     exit 1
 fi
+/usr/local/lib/niri-personal/niri validate -c "$HOME/.config/niri/config.kdl"
 session_import=()
 for name in DISPLAY WAYLAND_DISPLAY XDG_SEAT XDG_SESSION_ID XDG_SESSION_TYPE \
     XDG_SESSION_CLASS XDG_VTNR XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_DATA_DIRS PATH; do

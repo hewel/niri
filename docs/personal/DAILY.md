@@ -1,76 +1,84 @@
-# Daily desktop setup after HDR video acceptance
+# Daily desktop with the existing niri configuration
 
-The daily setup was installed on 2026-10-09 after the user's explicit real TTY HDR10 video acceptance. Installation evidence is in `personal/daily/installation.json`; the current desktop was not switched. A user-observed HDR video pass must be recorded in `personal/validation/hdr-video/acceptance.json` before `scripts/personal-install-daily.sh --install` proceeds. That record must identify the accepted binary SHA-256, so acceptance cannot accidentally authorize a different build. The installer does not generate a pass. Installation uses cached sudo authorization or a single system Polkit authentication for the GDM entry and separate binary/service files.
+The personal session uses `/usr/local/lib/niri-personal/niri` and the single existing
+entry point `~/.config/niri/config.kdl`. There is no active `config-smooth.kdl` or
+separate personal config overlay. Select **Niri HDR + Glass** in GDM at the next
+login. The original binary and session files remain installed.
 
-The candidate config is generated from `examples/personal/daily.kdl.in`, replacing `@USER_CONFIG@` with the quoted absolute path of the user's existing config. It includes that config so existing binds, autostarts, application rules and future ordinary config edits remain live. The original config is not changed. The first DP-1 block preserves the detected host's mode, scale, position, startup focus and hot corner while adding HDR `auto`. **Output blocks use first-match resolution**, so this complete override precedes the included original; synchronize it if the original output settings change. No HDR peak override is added.
-
-Glass is enabled with xray only for the matched applications that already had blur rules. Client transparency is retained. Noctalia's non-xray rules retain their original background effects. Unsupported Glass combinations retain the port's documented fallback.
-
-The installed files are:
-
-| File | Purpose |
-| --- | --- |
-| `/usr/local/lib/niri-personal/niri` | Separate custom binary; `/usr/bin/niri` is retained |
-| `/usr/local/bin/niri-personal-session` | Separate session wrapper, never invokes stock `niri-session` |
-| `/usr/local/lib/systemd/user/niri-personal.service` | Absolute custom binary/config paths and normal notify/session integration |
-| `/usr/local/lib/systemd/user/niri-personal-shutdown.target` | Stops the graphical session after the personal service ends |
-| `/usr/share/wayland-sessions/niri-personal.desktop` | GDM choice named **Niri HDR + Glass** |
-| `~/.config/niri-personal/config.kdl` | Independent config overlay |
-
-Before importing any environment or starting/stopping services, the wrapper refuses an existing active/activating graphical session. The service clears the trial-only notification suppression variable and uses `--session` for normal portal/autostart integration. User D-Bus and graphical session targets are shared; these two daily sessions are alternatives, not parallel sessions. [systemd desktop session guidance](https://github.com/systemd/systemd/blob/main/docs/DESKTOP_ENVIRONMENTS.md)
-
-The installer backs up the original config and any pre-existing files at these personal installation paths. It then copies the staged files and reloads unit definitions. It does not start/enable a service, restart GDM, log out, change the remembered session choice or switch VTs. Select **Niri HDR + Glass** in GDM on the next login. Select the original **Niri** entry to return to the stock binary and original configuration.
-
-After the first personal login, verify Noctalia, wallpaper, application shortcuts, Glass, HDR fullscreen entry/exit and portal capture. The installed service executable/config paths are already verified; the first actual GDM login and its application/portal integration remain pending. The `DesktopNames=niri` field follows the installed niri/GDM session entry convention; the generic desktop-file validator flags it in both the stock and personal entries as a nonstandard key.
-
-Preparation checks passed: candidate config parsing, shell syntax, refusal of the running original graphical session without environment import, and installer refusal before any write when acceptance is absent. A read-only reviewer identified the output first-match requirement and the autostart target ordering; both were addressed. `systemd-analyze --user verify` passed both on staged-path copies and on the exact installed paths after installation. The installed binary SHA-256 matches the accepted artifact; 13 original binary/session/config files retained their hashes. Stock `niri.service` remained active and `niri-personal.service` inactive. No service was started or stopped by these checks.
-
-The original configuration backup is `/home/hewel/Codes/niri/personal/daily/backup-U4qvxm5O/original-niri-config`. To return to stock behavior, select **Niri** in GDM; there is no original configuration change to undo.
-
-## Accepted smooth-corner daily upgrade
-
-On 2026-10-09 the user accepted the corrected smooth-corner build
-`0d489c96f6c74b1ad5992a80298eafac3f97ac0e` for daily trial. Its SHA-256 is
+The user chose the custom version as the daily default on 2026-10-09. Its accepted
+render build is `0d489c96f6c74b1ad5992a80298eafac3f97ac0e`, SHA-256
 `b296f3dce6fa779d114058c4be1ba84a0e23a3ac9ed2062e1c24d6b6ca9bbc3b`.
-This is visual corner acceptance; the earlier real HDR10 acceptance remains tied
-to its original binary. New-build HDR video, capture and multiple-output color
-acceptance are not inferred from the corner pass.
+The corner visual pass authorizes daily use; earlier physical HDR10 acceptance is
+still tied to the earlier build. New-build video, capture and multi-output color
+checks remain separate from corner acceptance.
 
-The explicit upgrade command is `scripts/personal-install-daily.sh --install-smooth`.
-It requires the matching user-observed record in
-`personal/validation/corner-aa/daily-acceptance.json`, validates the candidate, and
-refuses an active personal service. The binary is replaced by renaming a new inode.
-The service is switched to `~/.config/niri-personal/config-smooth.kdl` for the next
-login; this overlay includes the existing `config.kdl`, so its current double-output
-layout and locally maintained rules remain live. Neither the base personal config
-nor the original Niri config is rewritten. The overlay sets window radius **12**
-and `smoothing=0.65`, retaining the host's existing radius rather than the demo's 32.
-Edit this independent overlay to change the daily window radius or smoothing.
+Maintain the differences in the existing files:
 
-Generate the staged overlay before installation:
+| File | Custom settings |
+| --- | --- |
+| `cfg/outputs.kdl` | `hdr mode="auto"` inside each existing DP-1 / HDMI-A-1 block; existing modes, scale, position and hot corners retained |
+| `cfg/layout.kdl` | Existing radius 12 gains `smoothing=0.65`; clipping and other layout settings retained |
+| `cfg/rules.kdl` | Existing five blur-only window rule groups gain xray Glass with the accepted preset; Noctalia/anyrun non-xray rules retained |
+
+There are no duplicated output overrides. Change connector names, resolution,
+scaling and HDR in the same output blocks. Change radius/smoothing in the existing
+global window rule. Change per-application Glass in the existing rules. The root
+config, binds, autostarts, environment, overview and input files are reused verbatim.
+
+Because the original compositor was active during preparation, the three changed
+files are staged in `~/.config/niri/.pending-personal/candidate`. The session wrapper
+applies them once, **after** refusing any running graphical session and **before**
+importing environment or starting the personal service. It validates the candidate,
+checks that the source config has not changed, applies only the three files, and
+validates the result. Failures roll back, and interrupted writes are recovered only
+if the files still contain the known old/new bytes. Later user edits are not reapplied
+or overwritten on subsequent logins. If you edit the base config before the first
+personal login, migration stops with a diagnostic and requires a freshly reviewed
+preparation rather than replacing your edits.
+
+The previous files are retained in `~/.config/niri/.pending-personal/original` and
+`personal/daily/unified/original`. Installation evidence is in
+`personal/daily/unified-installation.json`; older overlay deployment evidence remains
+in `personal/daily/installation.json` and `smooth-installation.json`. Old personal
+config files may remain as inactive backups; the installed service does not read them.
+
+To prepare this host-specific migration from the worktree (explicitly reviewed
+DP-1/HDMI-A-1 blocks, radius 12 and five blur groups):
 
 ```sh
-python3 - <<'PY'
-import json
-from pathlib import Path
-template = Path('examples/personal/daily-smooth.kdl.in').read_text()
-config = str(Path.home() / '.config/niri-personal/config.kdl')
-Path('../daily/config-smooth.kdl').write_text(template.replace('@PERSONAL_CONFIG@', json.dumps(config)))
-PY
-scripts/personal-install-daily.sh --install-smooth
+scripts/personal-unify-config.py prepare --stage-dir ../daily/unified
+scripts/personal-install-daily.sh --install-unified
 ```
 
-Installation evidence is recorded separately in `personal/daily/smooth-installation.json`.
-The upgrade was installed successfully: the installed binary matches the accepted
-hash, its installed overlay parses, and `systemd-analyze --user verify` passes.
-Seventeen original/base personal files retained their hashes; the original service
-stayed active and the personal service inactive. Missing acceptance, mismatched
-artifact and active personal session preflights refused before writes. An independent
-source review checked executable replacement, old-config isolation and copied-byte
-hash validation. These checks do not start a desktop or stand in for daily use.
-The installer prints the backup directory containing the prior personal binary,
-configuration and session files. Choose **Niri HDR + Glass** on the next GDM login.
-No automatic logout or service restart occurs. The original **Niri** login remains
-the immediate fallback. During daily use check the existing HDR video again, move
-windows between the two outputs, and check screenshot/screencast colors; these are
-distinct from the accepted corner appearance and automated rendering checks.
+An existing stage/pending directory is never overwritten. Preserve it before preparing
+a replacement. This is a one-time config migration, not an unattended updater.
+The installer still verifies the user-observed acceptance hash, checks the copied
+binary again after authentication, backs up installed files, and reloads unit
+metadata without restarting, logging out, or switching desktops. Legacy `--install`
+and `--install-smooth` options are retained for reproducing the earlier staged setups.
+
+The installed service, wrapper and separate binary retain normal niri `--session`,
+notify, portal and autostart integration. The wrapper refuses an active graphical
+session before making config or user-manager changes. A first GDM launch with the
+unified config remains a user-operated check; no desktop is launched by validation.
+
+## Returning to the original binary
+
+The original `/usr/bin/niri` does not parse `hdr`, `liquid-glass` or `smoothing`.
+Selecting **Niri** requires restoring compatible config first. After daily use,
+back up any newer changes, then restore the three original files:
+
+```sh
+cd ~/.config/niri
+backup=$(mktemp -d ~/Codes/niri/personal/daily/before-config-rollback-XXXXXXXX)
+cp -a cfg "$backup/"
+for name in outputs layout rules; do
+    cp -a ".pending-personal/original/cfg/$name.kdl" "cfg/$name.kdl"
+done
+/usr/bin/niri validate -c config.kdl
+```
+
+Then log out and select **Niri**. Other config files are retained. If you have edited
+these three files during daily use, merge those edits from the rollback backup after
+removing only the unsupported custom settings. The completed migration remains
+marked applied, so subsequent personal logins do not silently restore custom settings.
