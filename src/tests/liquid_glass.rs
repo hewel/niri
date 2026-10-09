@@ -107,55 +107,69 @@ fn glass_sdr_input_is_encoded_once_and_output_state_is_restored() {
     };
     let color = Color32F::from([0.25, 0.5, 0.75, 1.]);
     for output in [None, HDR] {
-        let xray = wallpaper(color);
-        blend::set_frame_blend(&mut renderer, output);
-        // The ordinary consumer goes first, sharing the same wallpaper capture/cache.
-        let ordinary = elements(
-            &mut renderer,
-            &xray,
-            ConfigEffect {
-                xray: Some(true),
-                ..Default::default()
-            },
-            geometry(),
-        );
-        let glass = elements(
-            &mut renderer,
-            &xray,
-            ConfigEffect {
-                xray: Some(true),
-                liquid_glass: Some(neutral_glass()),
-                ..Default::default()
-            },
-            geometry(),
-        );
-        let audit =
-            gpu::render_offscreen_audited(&mut renderer, (SIZE, SIZE).into(), 1., &glass).unwrap();
-        assert!(audit.texture_programs.contains(&"liquid_glass_and_clip"));
-        let ordinary_pixels = pixels(&mut renderer, &ordinary);
-        let glass_pixels = pixels(&mut renderer, &glass);
-        let expected = if output.is_some() {
-            blend::srgb_to_pq(color, 203. / 10000.)
-        } else {
-            color
-        };
-        let expected = expected.components().map(|v| (v * 255.).round() as u8);
-        for actual in [
-            pixel(&ordinary_pixels, 64, 64),
-            pixel(&glass_pixels, 64, 64),
-        ] {
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!(
-                    actual.abs_diff(expected) <= 2,
-                    "actual {actual}, expected {expected}, output {output:?}"
-                );
+        for glass_first in [false, true] {
+            let xray = wallpaper(color);
+            blend::set_frame_blend(&mut renderer, output);
+            // Either consumer can prepare the shared capture first; a cached Glass program
+            // must not leak into an ordinary consumer created afterwards.
+            let mut configs = [
+                ConfigEffect {
+                    xray: Some(true),
+                    ..Default::default()
+                },
+                ConfigEffect {
+                    xray: Some(true),
+                    liquid_glass: Some(neutral_glass()),
+                    ..Default::default()
+                },
+            ];
+            if glass_first {
+                configs.reverse();
             }
+            let mut draws =
+                configs.map(|config| elements(&mut renderer, &xray, config, geometry()));
+            if glass_first {
+                draws.reverse();
+            }
+            let [ordinary, glass] = draws;
+            let audit =
+                gpu::render_offscreen_audited(&mut renderer, (SIZE, SIZE).into(), 1., &glass)
+                    .unwrap();
+            assert!(audit.texture_programs.contains(&"liquid_glass_and_clip"));
+            let ordinary_audit =
+                gpu::render_offscreen_audited(&mut renderer, (SIZE, SIZE).into(), 1., &ordinary)
+                    .unwrap();
+            assert!(ordinary_audit
+                .texture_programs
+                .contains(&"postprocess_and_clip"));
+            assert!(!ordinary_audit
+                .texture_programs
+                .contains(&"liquid_glass_and_clip"));
+            let ordinary_pixels = pixels(&mut renderer, &ordinary);
+            let glass_pixels = pixels(&mut renderer, &glass);
+            let expected = if output.is_some() {
+                blend::srgb_to_pq(color, 203. / 10000.)
+            } else {
+                color
+            };
+            let expected = expected.components().map(|v| (v * 255.).round() as u8);
+            for actual in [
+                pixel(&ordinary_pixels, 64, 64),
+                pixel(&glass_pixels, 64, 64),
+            ] {
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert!(
+                        actual.abs_diff(expected) <= 2,
+                        "actual {actual}, expected {expected}, output {output:?}"
+                    );
+                }
+            }
+            assert_eq!(pixel(&glass_pixels, 0, 0), [0, 0, 0, 0]);
+            assert_eq!(
+                glass_pixels, ordinary_pixels,
+                "neutral glass changes color/rounded alpha"
+            );
         }
-        assert_eq!(pixel(&glass_pixels, 0, 0), [0, 0, 0, 0]);
-        assert_eq!(
-            glass_pixels, ordinary_pixels,
-            "neutral glass changes color/rounded alpha"
-        );
     }
     // Restore a nondefault SDR capture reference, then draw HDR content through that state.
     blend::set_sdr_capture_blend(&mut renderer, 100.);

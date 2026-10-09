@@ -342,7 +342,7 @@ impl Client {
         tf: TransferFunction,
         primaries: Primaries,
         intent: RenderIntent,
-    ) {
+    ) -> WpColorManagementSurfaceV1 {
         let manager = self.state.color_manager.clone().expect("manager not bound");
 
         let creator = manager.create_parametric_creator(&self.qh, ());
@@ -357,6 +357,7 @@ impl Client {
         let cm_surface = manager.get_surface(surface, &self.qh, ());
         cm_surface.set_image_description(&image, intent);
         self.connection.flush().unwrap();
+        cm_surface
     }
 
     /// Like [`create_and_attach_hdr_description`](Self::create_and_attach_hdr_description), but

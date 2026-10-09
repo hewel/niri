@@ -14,7 +14,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
-use crate::render_helpers::liquid_glass::LiquidGlassOptions;
+use crate::render_helpers::liquid_glass::GlassRequest;
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -40,7 +40,7 @@ pub struct Options {
     pub xray: Option<bool>,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
-    pub liquid_glass: Option<LiquidGlassOptions>,
+    pub liquid_glass: Option<GlassRequest>,
 }
 
 impl Options {
@@ -191,17 +191,12 @@ impl BackgroundEffect {
             effect.blur == Some(true)
         };
 
-        let liquid_glass = effect.liquid_glass.filter(|glass| !glass.off);
-        if liquid_glass.is_some() && effect.xray == Some(false) {
-            super::liquid_glass::warn_nonxray();
-        }
-
         let options = Options {
             blur,
             xray: effect.xray,
             noise: effect.noise,
             saturation: effect.saturation,
-            liquid_glass: liquid_glass.filter(|_| effect.xray != Some(false)),
+            liquid_glass: GlassRequest::from_config(effect.liquid_glass, effect.xray),
         };
 
         if self.options == options && self.corner_radius == corner_radius {
@@ -227,10 +222,9 @@ impl BackgroundEffect {
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         let mut options = self.options;
-        if options.liquid_glass.is_some() && ctx.renderer.as_gles_renderer().is_none() {
-            super::liquid_glass::warn_vulkan();
-            options.liquid_glass = None;
-        }
+        options.liquid_glass = options
+            .liquid_glass
+            .and_then(|glass| glass.for_renderer(ctx.renderer));
         if !options.is_visible() {
             return;
         }

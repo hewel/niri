@@ -518,9 +518,8 @@ fn scene_xray_layer_surface_draws_gles() {
 #[test]
 fn scene_liquid_glass_checks_background_metadata_and_overview() {
     use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{Primaries, RenderIntent, TransferFunction};
-    for hdr_wallpaper in [false, true] {
-        let config = Config::parse_mem(
-            r#"
+    let config = Config::parse_mem(
+        r#"
             window-rule {
                 geometry-corner-radius 12 smoothing=0.65
                 clip-to-geometry true
@@ -532,26 +531,31 @@ fn scene_liquid_glass_checks_background_metadata_and_overview() {
                 }
             }
         "#,
-        )
-        .unwrap();
-        let Some(mut f) = set_up(config) else {
-            return;
-        };
-        let (id, surface) = add_wallpaper(&mut f);
+    )
+    .unwrap();
+    let Some(mut f) = set_up(config) else {
+        return;
+    };
+    let (id, surface) = add_wallpaper(&mut f);
+    add_window(&mut f);
+    settle(&mut f);
+    let mut color_surface = None;
+    let mut drew_blur = false;
+    // Reuse the wallpaper and capture across SDR -> HDR -> SDR metadata commits.
+    for hdr_wallpaper in [false, true, false] {
         if hdr_wallpaper {
-            f.client(id).create_and_attach_hdr_description(
+            color_surface = Some(f.client(id).create_and_attach_hdr_description(
                 &surface,
                 TransferFunction::St2084Pq,
                 Primaries::Bt2020,
                 RenderIntent::Perceptual,
-            );
-            surface.commit();
-            f.double_roundtrip(id);
+            ));
+        } else if let Some(color_surface) = &color_surface {
+            color_surface.unset_image_description();
         }
-        add_window(&mut f);
-        settle(&mut f);
-        let mut drew_blur = false;
-        for blend in [None, HDR_BLEND] {
+        surface.commit();
+        f.double_roundtrip(id);
+        for blend in [None, HDR_BLEND, None, HDR_BLEND] {
             let audit = render_scene(&mut f, blend);
             assert_eq!(
                 audit.texture_programs.contains(&"liquid_glass_and_clip"),
@@ -564,15 +568,14 @@ fn scene_liquid_glass_checks_background_metadata_and_overview() {
                 assert!(audit.texture_programs.contains(&"postprocess_and_clip"));
             }
         }
-        assert!(drew_blur);
-        // Glass uses the same coordinate transforms and damage in the zoomed overview.
-        f.niri().layout.open_overview();
-        set_time(&mut f, Duration::from_millis(100));
-        let audit = render_scene(&mut f, HDR_BLEND);
-        if !hdr_wallpaper {
-            assert!(audit.texture_programs.contains(&"liquid_glass_and_clip"));
-        }
     }
+    // A metadata-only commit can reuse the blurred texture; it need not re-run blur.
+    assert!(drew_blur);
+    // Glass uses the same coordinate transforms and damage in the zoomed overview.
+    f.niri().layout.open_overview();
+    set_time(&mut f, Duration::from_millis(100));
+    let audit = render_scene(&mut f, HDR_BLEND);
+    assert!(audit.texture_programs.contains(&"liquid_glass_and_clip"));
 }
 
 fn add_wallpaper(f: &mut Fixture) -> (ClientId, WlSurface) {
