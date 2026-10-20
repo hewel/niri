@@ -1,5 +1,63 @@
 # Validation record and display checklist
 
+## Official upstream integration, 2026-10-20
+
+The personal branch integrates official niri through
+`f51d761c456d635084b2f117a9ccbe9b96ad5aca` (51 upstream commits after the
+shared `5f4469b6` base). Its adjacent Smithay checkout is pinned to
+`452641cd981cfc2146a56fc38592ba8f4c592b99`, merging the previous custom
+`a6a4be6d4` with official `8a270232f`. The existing `personal/smithay`
+development checkout was not changed. [versions.env](versions.env) records the
+new source boundary.
+
+The merge retains HDR, Vulkan, Glass, smooth corners and minimized windows.
+Gamma-control updates deferred while the HDR post-blend encoder owns the LUT now
+use the upstream `GammaProps` modes. Pending resets and installed LUT, legacy or
+CTM adjustments continue to block post-blend encoding. Screenshot capture and UI
+opening both retain renderer-generic dispatch; IME popup overflow retains the
+minimized-window lookup fallback.
+
+Completed checks:
+
+- `cargo build --locked --workspace`: passed, including the visual-test executable.
+- Locked feature checks passed with no default features, individually with `dbus`,
+  `systemd`, `dinit` and `xdp-gnome-screencast`, with default features, and with
+  `profile-with-tracy`.
+- `NIRI_TEST_REQUIRE_GPU=1 LIBGL_ALWAYS_SOFTWARE=1 cargo test --locked --workspace
+  --exclude niri-visual-tests`: 318 passed, one existing optional Glass comparison
+  ignored. This includes actual GLES/Vulkan renderer execution, not only compilation.
+- `cargo clippy --locked --workspace --all-targets`: completed successfully with
+  lint warnings; no automatic lint fixes were applied.
+- The built `target/debug/niri` validated `glass.kdl`, `glass-test-preset.kdl`,
+  `hdr-dp-1.kdl`, `smooth-corners.kdl` and `smooth-hdr-dp-1.kdl`.
+- An isolated nested compositor on `/dev/dri/renderD128` exercised Glass and smooth
+  corners, fullscreen entry/exit, black-to-transparent fullscreen backdrop reload,
+  overview, custom minimize/restore, touchpad event-stream transitions and the
+  screenshot UI with omitted optional IPC fields. It exited with status 0.
+  Fullscreen backdrop screenshots differed at 3,993,566 pixels.
+
+Runtime evidence is under
+`personal/validation/upstream-20261020/runtime-confirmed/` in this checkout:
+`result.json`, `nested.log` and five PNG captures. The first run completed the
+behavior checks but its temporary driver incorrectly expected an IPC reply after
+Quit; the confirming run handles shutdown without that assumption.
+
+`cargo +nightly fmt --all -- --check` found formatting debt in nine files that also
+fail formatting at the pre-merge HEAD. The new gamma predicate follows rustfmt's
+output; unrelated code was not reformatted.
+
+Independent source review found and resolved the stale gamma-state field access.
+It also identified pre-existing behavior outside this merge: resume applies gamma
+without the HDR ownership guard, minimized-strip clicks can restore windows behind
+the lock screen, and an already-started swipe can survive lock/screenshot entry.
+Those paths were not changed or claimed fixed.
+
+No daily installation, parent-session restart, physical HDR/VRR test or hardware
+suspend/resume acceptance was performed. Nested output does not support VRR, so
+the new fullscreen-only rule was parsed and integrated but not validated on a
+physical variable-refresh output. Earlier human acceptance records below apply
+to their recorded builds, not to this candidate.
+
 ## Checks completed on this host
 
 These results distinguish compilation, renderer execution and physical display testing. Logs are retained under `/home/hewel/Codes/niri/personal/` outside the source tree.
