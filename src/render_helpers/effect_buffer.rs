@@ -185,7 +185,9 @@ impl EffectBuffer {
         }
     }
 
-    pub fn elements<R: XrayElementStore>(&mut self) -> &mut Vec<LayerSurfaceRenderElement<R>> {
+    pub(super) fn elements<R: XrayElementStore>(
+        &mut self,
+    ) -> &mut Vec<LayerSurfaceRenderElement<R>> {
         // Assume we're going to insert new elements, switch to New.
         match mem::take(&mut self.elements) {
             Elements::Unchanged(elements) | Elements::New(elements) => {
@@ -198,7 +200,7 @@ impl EffectBuffer {
         R::elements(store)
     }
 
-    pub fn clear_elements(&mut self) {
+    pub(super) fn clear_elements(&mut self) {
         match mem::take(&mut self.elements) {
             Elements::Unchanged(mut store) | Elements::New(mut store) => {
                 store.clear();

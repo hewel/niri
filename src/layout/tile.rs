@@ -1448,7 +1448,7 @@ impl<W: LayoutElement> Tile<W> {
     pub fn store_unmap_snapshot_if_empty<R: NiriCaptureRenderer>(
         &mut self,
         renderer: &mut R,
-        xray: Option<&mut Xray>,
+        xray: Option<&Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
     ) where
@@ -1468,7 +1468,7 @@ impl<W: LayoutElement> Tile<W> {
     fn render_snapshot<R: NiriCaptureRenderer>(
         &self,
         renderer: &mut R,
-        mut xray: Option<&mut Xray>,
+        xray: Option<&Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
     ) -> TileRenderSnapshot
@@ -1505,7 +1505,7 @@ impl<W: LayoutElement> Tile<W> {
             RenderCtx {
                 target: RenderTarget::Output,
                 renderer,
-                xray: xray.as_deref(),
+                xray,
             },
             Point::from((0., 0.)),
             xray_pos,
@@ -1513,87 +1513,48 @@ impl<W: LayoutElement> Tile<W> {
             &mut |elem| contents.push(elem),
         );
 
-        let mut contents_with_blocked_out_bg = None;
-
-        // Do a bit of pointer surgery on Xray.
-        //
-        // The idea is to avoid the combinatorial combination of rendering snapshots for target
-        // (Output, Screencast) × Xray target (Output, Screencast, ScreenCapture).
-        //
-        // Our main goals:
-        // - Everything must look unblocked for RenderTarget::Output.
-        // - If anything is potentially blocked-out, it must not show up on any screen capture.
-        //
-        // Right above we rendered a fully-unblocked snapshot for the Output, so that's covered.
-        //
-        // Next, *only if Xray has any blocked-out surfaces* (which is a rare case), we will render
-        // a snapshot where the window itself is unblocked, but the Xray background is blocked. To
-        // do this, we swap the Output target buffers in Xray with the Screencast target buffers
-        // (which were prepared for us higher up the stack).
-        //
-        // Finally, we render a fully blocked-out snapshot. If Xray has blocked-out surfaces, then
-        // Xray's Screencast buffers are already filled-in, but if not, then we swap in the Output
-        // buffers, to avoid an extra render. This is safe since we know there are no blocked
-        // surfaces there.
-        let output_idx = RenderTarget::Output as usize;
-        let screencast_idx = RenderTarget::Screencast as usize;
-        let mut screencast_background = None;
-        let mut screencast_backdrop = None;
-        let mut output_background = None;
-        let mut output_backdrop = None;
-        if let Some(xray) = &mut xray {
-            screencast_background = Some(Rc::clone(&xray.background[screencast_idx]));
-            screencast_backdrop = Some(Rc::clone(&xray.backdrop[screencast_idx]));
-            output_background = Some(Rc::clone(&xray.background[output_idx]));
-            output_backdrop = Some(Rc::clone(&xray.backdrop[output_idx]));
-
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = screencast_background.clone().unwrap();
-                xray.backdrop[output_idx] = screencast_backdrop.clone().unwrap();
-
+        let mut render_capture = |xray: Option<&Xray>| {
+            // Preserve a separate unblocked window with capture-safe background only when
+            // sensitive background layers make that combination necessary.
+            let contents_with_blocked_out_bg = if xray.is_some() && xray_has_blocked_out_layers {
                 let mut contents = Vec::new();
                 self.render(
                     RenderCtx {
                         target: RenderTarget::Output,
                         renderer,
-                        xray: Some(xray),
+                        xray,
                     },
                     Point::from((0., 0.)),
                     xray_pos,
                     false,
                     &mut |elem| contents.push(elem),
                 );
-                contents_with_blocked_out_bg = Some(bake(renderer, &contents));
+                Some(bake(renderer, &contents))
             } else {
-                xray.background[screencast_idx] = output_background.clone().unwrap();
-                xray.backdrop[screencast_idx] = output_backdrop.clone().unwrap();
-            }
-        }
+                None
+            };
 
-        // A bit of a hack to render blocked out as for screencast, but I think it's fine here.
-        let mut blocked_out_contents = Vec::new();
-        self.render(
-            RenderCtx {
-                target: RenderTarget::Screencast,
-                renderer,
-                xray: xray.as_deref(),
-            },
-            Point::from((0., 0.)),
-            xray_pos,
-            false,
-            &mut |elem| blocked_out_contents.push(elem),
-        );
-
-        // Put everything back to normal.
-        if let Some(xray) = &mut xray {
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = output_background.take().unwrap();
-                xray.backdrop[output_idx] = output_backdrop.take().unwrap();
-            } else {
-                xray.background[screencast_idx] = screencast_background.take().unwrap();
-                xray.backdrop[screencast_idx] = screencast_backdrop.take().unwrap();
-            }
-        }
+            let mut blocked_out_contents = Vec::new();
+            self.render(
+                RenderCtx {
+                    target: RenderTarget::Screencast,
+                    renderer,
+                    xray,
+                },
+                Point::from((0., 0.)),
+                xray_pos,
+                false,
+                &mut |elem| blocked_out_contents.push(elem),
+            );
+            (contents_with_blocked_out_bg, blocked_out_contents)
+        };
+        let (contents_with_blocked_out_bg, blocked_out_contents) = if let Some(xray) = xray {
+            xray.with_snapshot_background(xray_has_blocked_out_layers, |xray| {
+                render_capture(Some(xray))
+            })
+        } else {
+            render_capture(None)
+        };
 
         let texture = bake(renderer, &contents);
         let blocked_out_texture = bake(renderer, &blocked_out_contents);

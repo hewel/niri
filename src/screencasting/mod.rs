@@ -19,6 +19,7 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, Stream
 use crate::layout::tile::TileRenderElement;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
+use crate::render_helpers::blend::with_sdr_capture;
 use crate::render_helpers::renderer::NiriCaptureRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -210,50 +211,54 @@ impl State {
             }
 
             crate::with_primary_renderer_any!(self.backend, |renderer| {
-                let mut elements = Vec::new();
-                let mut pointer_location = Point::default();
-
-                if self.niri.pointer_visibility.is_visible() {
-                    if let Some((pointer_pos, win_pos)) =
-                        self.niri.pointer_pos_for_window_cast(mapped)
-                    {
-                        // Pointer location must be relative to the screencast buffer.
-                        // - win_pos is the position of the main window surface in output-local
-                        //   coordinates
-                        // - bbox.loc moves us relative to the screencast buffer
-                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
-                        let output_pos =
-                            self.niri.global_space.output_geometry(output).unwrap().loc;
-                        pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
-
-                        let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                        self.niri.render_pointer(renderer, output, &mut |elem| {
-                            let elem =
-                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                            elements.push(CastRenderElement::from(elem));
-                        });
-                    }
-                }
-
-                let main_start = elements.len();
-                mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
-                    elements.push(CastRenderElement::from(elem))
-                });
-
-                let cursor_data =
-                    CursorData::compute(&elements, main_start, pointer_location, scale);
-
                 let reference_luminance = self.niri.output_capture_reference_luminance(output);
-                if cast.dequeue_buffer_and_render(
-                    renderer,
-                    &elements,
-                    &cursor_data,
-                    bbox.size,
-                    scale,
-                    reference_luminance,
-                ) {
-                    cast.record_frame_time(get_monotonic_time());
-                }
+                with_sdr_capture(renderer, reference_luminance, |renderer| {
+                    let mut elements = Vec::new();
+                    let mut pointer_location = Point::default();
+
+                    if self.niri.pointer_visibility.is_visible() {
+                        if let Some((pointer_pos, win_pos)) =
+                            self.niri.pointer_pos_for_window_cast(mapped)
+                        {
+                            // Pointer location must be relative to the screencast buffer.
+                            // - win_pos is the position of the main window surface in output-local
+                            //   coordinates
+                            // - bbox.loc moves us relative to the screencast buffer
+                            let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                            let output_pos =
+                                self.niri.global_space.output_geometry(output).unwrap().loc;
+                            pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
+
+                            let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
+                            self.niri.render_pointer(renderer, output, &mut |elem| {
+                                let elem = RelocateRenderElement::from_element(
+                                    elem,
+                                    pos,
+                                    Relocate::Relative,
+                                );
+                                elements.push(CastRenderElement::from(elem));
+                            });
+                        }
+                    }
+
+                    let main_start = elements.len();
+                    mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
+                        elements.push(CastRenderElement::from(elem))
+                    });
+
+                    let cursor_data =
+                        CursorData::compute(&elements, main_start, pointer_location, scale);
+
+                    if cast.dequeue_buffer_and_render(
+                        renderer,
+                        &elements,
+                        &cursor_data,
+                        bbox.size,
+                        scale,
+                    ) {
+                        cast.record_frame_time(get_monotonic_time());
+                    }
+                });
             });
 
             break;
@@ -566,24 +571,17 @@ impl Niri {
 
         let scale = Scale::from(output.current_scale().fractional_scale());
 
-        let mut elements = Vec::new();
-        let mut cursor_data = None;
-
         let mut casts_to_stop = vec![];
 
         let mut casts = mem::take(&mut self.casting.casts);
-        for cast in &mut casts {
-            if !cast.is_active() {
-                continue;
-            }
-
-            if !cast.target.matches_output(&weak) {
-                continue;
+        let mut ready_casts = casts.iter_mut().filter_map(|cast| {
+            if !cast.is_active() || !cast.target.matches_output(&weak) {
+                return None;
             }
 
             match cast.ensure_size(size) {
                 Ok(CastSizeChange::Ready) => (),
-                Ok(CastSizeChange::Pending) => continue,
+                Ok(CastSizeChange::Pending) => return None,
                 Err(err) => {
                     warn!("error updating stream size, stopping screencast: {err:?}");
                     casts_to_stop.push(cast.session_id);
@@ -591,10 +589,15 @@ impl Niri {
             }
 
             if cast.check_time_and_schedule(output, target_presentation_time) {
-                continue;
+                return None;
             }
+            Some(cast)
+        });
 
-            if cursor_data.is_none() {
+        if let Some(first) = ready_casts.next() {
+            let reference_luminance = self.output_capture_reference_luminance(output);
+            with_sdr_capture(renderer, reference_luminance, |renderer| {
+                let mut elements = Vec::new();
                 let mut pointer_pos = Point::default();
                 if self.pointer_visibility.is_visible() {
                     let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
@@ -619,26 +622,20 @@ impl Niri {
                 };
                 self.render(ctx, output, false, &mut |elem| elements.push(elem.into()));
 
-                cursor_data = Some(CursorData::compute(
-                    &elements,
-                    main_start,
-                    pointer_pos,
-                    scale,
-                ));
-            }
-            let cursor_data = cursor_data.as_ref().unwrap();
+                let cursor_data = CursorData::compute(&elements, main_start, pointer_pos, scale);
 
-            let reference_luminance = self.output_capture_reference_luminance(output);
-            if cast.dequeue_buffer_and_render(
-                renderer,
-                &elements,
-                cursor_data,
-                size,
-                scale,
-                reference_luminance,
-            ) {
-                cast.record_frame_time(target_presentation_time);
-            }
+                for cast in std::iter::once(first).chain(ready_casts) {
+                    if cast.dequeue_buffer_and_render(
+                        renderer,
+                        &elements,
+                        &cursor_data,
+                        size,
+                        scale,
+                    ) {
+                        cast.record_frame_time(target_presentation_time);
+                    }
+                }
+            });
         }
         self.casting.casts = casts;
 
@@ -695,46 +692,48 @@ impl Niri {
                 continue;
             }
 
-            let mut elements = Vec::new();
-            let mut pointer_location = Point::default();
-
-            if self.pointer_visibility.is_visible() {
-                if let Some((pointer_pos, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
-                    // Pointer location must be relative to the screencast buffer.
-                    // - win_pos is the position of the main window surface in output-local
-                    //   coordinates
-                    // - bbox.loc moves us relative to the screencast buffer
-                    let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
-                    let output_pos = self.global_space.output_geometry(output).unwrap().loc;
-                    pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
-
-                    let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                    self.render_pointer(renderer, output, &mut |elem| {
-                        let elem =
-                            RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                        elements.push(CastRenderElement::from(elem));
-                    });
-                }
-            }
-
-            let main_start = elements.len();
-            mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
-                elements.push(CastRenderElement::from(elem))
-            });
-
-            let cursor_data = CursorData::compute(&elements, main_start, pointer_location, scale);
-
             let reference_luminance = self.output_capture_reference_luminance(output);
-            if cast.dequeue_buffer_and_render(
-                renderer,
-                &elements,
-                &cursor_data,
-                bbox.size,
-                scale,
-                reference_luminance,
-            ) {
-                cast.record_frame_time(target_presentation_time);
-            }
+            with_sdr_capture(renderer, reference_luminance, |renderer| {
+                let mut elements = Vec::new();
+                let mut pointer_location = Point::default();
+
+                if self.pointer_visibility.is_visible() {
+                    if let Some((pointer_pos, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
+                        // Pointer location must be relative to the screencast buffer.
+                        // - win_pos is the position of the main window surface in output-local
+                        //   coordinates
+                        // - bbox.loc moves us relative to the screencast buffer
+                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                        let output_pos = self.global_space.output_geometry(output).unwrap().loc;
+                        pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
+
+                        let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
+                        self.render_pointer(renderer, output, &mut |elem| {
+                            let elem =
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                            elements.push(CastRenderElement::from(elem));
+                        });
+                    }
+                }
+
+                let main_start = elements.len();
+                mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
+                    elements.push(CastRenderElement::from(elem))
+                });
+
+                let cursor_data =
+                    CursorData::compute(&elements, main_start, pointer_location, scale);
+
+                if cast.dequeue_buffer_and_render(
+                    renderer,
+                    &elements,
+                    &cursor_data,
+                    bbox.size,
+                    scale,
+                ) {
+                    cast.record_frame_time(target_presentation_time);
+                }
+            });
         }
         self.casting.casts = casts;
 

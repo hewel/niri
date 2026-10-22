@@ -1748,7 +1748,7 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn store_unmap_snapshot_if_empty<R: NiriCaptureRenderer>(
         &mut self,
         renderer: &mut R,
-        xray: Option<&mut Xray>,
+        xray: Option<&Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
         window: &W::Id,

@@ -1,6 +1,6 @@
 # Personal niri
 
-Terms for choosing and using the personal niri build alongside its existing desktop configuration.
+Terms for the personal niri desktop, its rendering, and choosing the build used at login.
 
 ## Language
 
@@ -19,3 +19,15 @@ The preceding accepted personal build selected for daily use. The system-provide
 
 **Daily deployment**:
 The process of making an accepted build available as the daily build while retaining a rollback build.
+
+**Xray background**:
+The background sampled by a window effect independently of the foreground windows beneath it. Background content hidden from a capture must remain hidden when it is sampled by that capture's effects or window animations.
+
+**Capture target**:
+The intended audience of a rendered scene: the live output, a screencast, or another screen capture. Its visibility rules are independent of the image's color space and storage format.
+
+**SDR capture**:
+A captured image in SDR color space, including conversion of HDR content using the source output's reference luminance.
+
+**Window unmap**:
+A mapped window leaving the desktop. Removing its buffer retains the toplevel for a fresh configuration and later mapping; destroying the toplevel does not.

@@ -1,5 +1,55 @@
 # Validation record and display checklist
 
+## Xray, SDR capture and window unmap, 2026-10-22
+
+The three architecture candidates are implemented on top of
+`1a2305913fb59cafab15ee7d689627c05ce8a7f8`; their ownership contracts are in
+[ARCHITECTURE.md](ARCHITECTURE.md). The adjacent pinned Smithay and the user's
+untracked `validation/` directory were not changed.
+
+Completed checks:
+
+- `cargo build --release --locked --package niri`: passed. The local candidate is
+  `target/release/niri`, reporting `niri 26.04 (v26.04-297-g1a230591-modified)`.
+  This is a development-worktree candidate, not a published or accepted daily build.
+- `NIRI_TEST_REQUIRE_GPU=1 LIBGL_ALWAYS_SOFTWARE=1 cargo test --locked --workspace
+  --exclude niri-visual-tests`: 324 passed, one existing opt-in Glass comparison
+  ignored. New tests cover real GLES/Vulkan HDR-content capture and restoration,
+  Xray target routing and frame cleanup, and Wayland unmap/destruction/remap behavior.
+  The existing real-renderer closing-animation test also passed.
+- Locked feature checks passed with no default features, individually with `dbus`,
+  `systemd`, `dinit` and `xdp-gnome-screencast`, with default features, and with
+  `profile-with-tracy`.
+- `cargo clippy --locked --workspace --all-targets`: passed with warnings.
+  No unrelated lint fixes were applied. Workspace formatting still reports existing
+  formatting debt; changed capture scopes and new tests were formatted without
+  reformatting unrelated code.
+- Two independent read-only reviews found no actionable patch-introduced issues
+  in capture state/restoration or Xray privacy/lifetime and window-exit ordering.
+  These reviews did not independently execute tests or a compositor.
+
+An isolated nested release compositor exercised circular/smooth corners, resize,
+asymmetric corners, fullscreen entry/exit, overview and restoration. All nine
+1871×2135 screenshots matched the baseline's decoded RGBA bytes exactly, with
+maximum channel difference zero. Evidence:
+
+- Before: `/tmp/niri-architecture-20261022-before/smooth-nested-q07q9oui/`
+- After: `/tmp/niri-architecture-20261022-after/smooth-nested-_devfpur/`
+- Comparison: `/tmp/niri-architecture-20261022-after/pixel-comparison.json`
+
+A second isolated run exercised screen and window screenshots, external `grim`
+capture, GTK window destruction followed by a new mapped window, and the screenshot
+selection interface captured by `grim`. Its screenshots and `result.json` are in
+`/tmp/niri-architecture-capture-gdj1ax4k/`. Both child compositors exited with status
+0; neither log contained warnings or errors. The screenshot selector and ordinary
+Glass scene were visually inspected. Temporary evidence under `/tmp` is not durable.
+
+No commit, push, daily installation or parent-session restart was performed for
+these changes. Physical HDR/TTY output, multiple physical outputs, complete
+PipeWire/portal sessions and an actual capture-blocked layer during a closing
+animation were not runtime-tested. Renderer tests and source review do not replace
+those acceptance checks or establish an unmeasured performance improvement.
+
 ## Official upstream integration, 2026-10-20
 
 The personal branch integrates official niri through

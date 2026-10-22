@@ -21,8 +21,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
-use crate::niri::{CastTarget, ClientState, LockState, State};
-use crate::utils::transaction::Transaction;
+use crate::niri::{ClientState, LockState, State, WindowUnmap};
 use crate::utils::{is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
@@ -264,61 +263,13 @@ impl CompositorHandler for State {
 
                 let id = mapped.id();
 
-                // This is a commit of a previously-mapped toplevel.
-                let is_mapped = is_mapped(surface);
-
-                // Must start the close animation before window.on_commit().
-                let transaction = Transaction::new();
-                if !is_mapped {
-                    let blocker = transaction.blocker();
-                    crate::with_primary_renderer_any!(self.backend, |renderer| {
-                        self.niri
-                            .layout
-                            .start_close_animation_for_window(renderer, &window, blocker);
-                    });
+                if !is_mapped(surface) {
+                    trace!("toplevel got unmapped");
+                    self.unmap_window(window, id, output, WindowUnmap::BufferRemoved);
+                    return;
                 }
 
                 window.on_commit();
-
-                if !is_mapped {
-                    // The toplevel got unmapped.
-                    //
-                    // Test client: wleird-unmap.
-                    trace!("toplevel got unmapped");
-
-                    let active_window = self.niri.layout.focus().map(|m| &m.window);
-                    let was_active = active_window == Some(&window);
-
-                    self.niri
-                        .stop_casts_for_target(CastTarget::Window { id: id.get() });
-
-                    self.niri.window_mru_ui.remove_window(id);
-                    self.niri.layout.remove_window(&window, transaction.clone());
-
-                    // If this is the only instance, then this transaction will complete
-                    // immediately, so no need to set the timer.
-                    if !transaction.is_last() {
-                        transaction.register_deadline_timer(
-                            &self.niri.event_loop,
-                            &self.niri.display_handle,
-                        );
-                    }
-
-                    if was_active {
-                        self.maybe_warp_cursor_to_focus();
-                    }
-
-                    // Newly-unmapped toplevels must perform the initial commit-configure sequence
-                    // afresh.
-                    let unmapped = Unmapped::new(window);
-                    self.niri.unmapped_windows.insert(surface.clone(), unmapped);
-
-                    if let Some(output) = output {
-                        self.niri.queue_redraw(&output);
-                        self.niri.queue_redraw_mru_output();
-                    }
-                    return;
-                }
 
                 let (serial, buffer_delta) = with_states(surface, |states| {
                     let buffer_delta = states

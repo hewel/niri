@@ -497,12 +497,8 @@ impl FrameBlendState {
         }
     }
 
-    pub fn set_sdr_capture(renderer: &mut GlesRenderer, reference_luminance: f64) {
-        Self::get(renderer).set_sdr_capture_values(reference_luminance);
-    }
-
     /// Sets the SDR capture values on this state directly.
-    pub fn set_sdr_capture_values(&self, reference_luminance: f64) {
+    fn set_sdr_capture_values(&self, reference_luminance: f64) {
         self.hdr_pq.set(false);
         self.ref_lum_scale
             .set((reference_luminance / 10000.) as f32);
@@ -997,55 +993,147 @@ pub fn set_frame_blend_vulkan(renderer: &mut VulkanRenderer, blend: Option<(f64,
     }
 }
 
-/// Configures the renderer for rendering into an SDR capture buffer, while preserving the
-/// reference luminance needed to convert HDR content back to SDR.
-pub fn set_sdr_capture_blend<R: CaptureBlend + ?Sized>(renderer: &mut R, reference_luminance: f64) {
-    renderer.set_sdr_capture_blend(reference_luminance);
+/// Runs scene preparation and rendering for an SDR capture using the source output's
+/// reference white, then restores the exact normal niri frame color state, also on `Err`.
+///
+/// This scope is independent of privacy (`RenderTarget`) and buffer storage format. Enter it
+/// before preparing render elements: preparation may itself render offscreen textures.
+/// Like `FrameBlendState::with_sdr`, it operates between frames, when only niri's normal
+/// frame-wide defaults are installed, never inside a per-content custom draw override.
+pub fn with_sdr_capture<R: CaptureBlend, T>(
+    renderer: &mut R,
+    reference_luminance: f64,
+    capture: impl FnOnce(&mut R) -> T,
+) -> T {
+    renderer.with_sdr_capture(reference_luminance, capture)
 }
 
-/// Configuring a renderer for rendering into SDR capture buffers.
+/// Scoped control of niri's normal frame color state for capture operations.
 pub trait CaptureBlend {
-    /// See [`set_sdr_capture_blend`].
-    fn set_sdr_capture_blend(&mut self, reference_luminance: f64);
+    fn with_sdr_capture<T>(
+        &mut self,
+        reference_luminance: f64,
+        capture: impl FnOnce(&mut Self) -> T,
+    ) -> T;
+}
+
+impl FrameBlendState {
+    fn save(&self) -> (bool, f32, f32) {
+        (
+            self.hdr_pq.get(),
+            self.ref_lum_scale.get(),
+            self.max_luminance.get(),
+        )
+    }
+
+    fn restore(&self, saved: (bool, f32, f32)) {
+        self.hdr_pq.set(saved.0);
+        self.ref_lum_scale.set(saved.1);
+        self.max_luminance.set(saved.2);
+    }
 }
 
 impl CaptureBlend for GlesRenderer {
-    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
-        FrameBlendState::set_sdr_capture(self, reference_luminance);
-        self.set_default_tex_program_override(None);
-        self.set_solid_color_transform(None);
+    fn with_sdr_capture<T>(
+        &mut self,
+        reference_luminance: f64,
+        capture: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let saved = FrameBlendState::get(self).save();
+        if saved.0 {
+            set_frame_blend(self, None);
+        }
+        FrameBlendState::get(self).set_sdr_capture_values(reference_luminance);
+        let result = capture(self);
+        if saved.0 {
+            set_frame_blend(
+                self,
+                Some((f64::from(saved.1) * 10000., f64::from(saved.2))),
+            );
+        }
+        FrameBlendState::get(self).restore(saved);
+        result
     }
 }
 
 impl CaptureBlend for VulkanRenderer {
-    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
+    fn with_sdr_capture<T>(
+        &mut self,
+        reference_luminance: f64,
+        capture: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         self.user_data().insert_if_missing(FrameBlendState::default);
+        let saved = self.user_data().get::<FrameBlendState>().unwrap().save();
+        if saved.0 {
+            set_frame_blend_vulkan(self, None);
+        }
         self.user_data()
             .get::<FrameBlendState>()
             .unwrap()
             .set_sdr_capture_values(reference_luminance);
-        self.set_default_color_params(None);
-        self.set_solid_color_transform(None);
+        let result = capture(self);
+        if saved.0 {
+            set_frame_blend_vulkan(
+                self,
+                Some((f64::from(saved.1) * 10000., f64::from(saved.2))),
+            );
+        }
+        self.user_data()
+            .get::<FrameBlendState>()
+            .unwrap()
+            .restore(saved);
+        result
     }
 }
 
 impl CaptureBlend for TtyRenderer<'_> {
-    fn set_sdr_capture_blend(&mut self, reference_luminance: f64) {
-        match self {
-            TtyRenderer::Gles(multi) => {
-                CaptureBlend::set_sdr_capture_blend(multi.as_mut(), reference_luminance)
-            }
+    fn with_sdr_capture<T>(
+        &mut self,
+        reference_luminance: f64,
+        capture: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let state = match self {
+            TtyRenderer::Gles(multi) => FrameBlendState::get(multi.as_mut()),
             TtyRenderer::Vulkan(multi) => {
                 let vk: &mut VulkanRenderer = multi.as_mut();
                 vk.user_data().insert_if_missing(FrameBlendState::default);
-                vk.user_data()
-                    .get::<FrameBlendState>()
-                    .unwrap()
-                    .set_sdr_capture_values(reference_luminance);
-                vk.set_default_color_params(None);
-                vk.set_solid_color_transform(None);
+                vk.user_data().get::<FrameBlendState>().unwrap()
             }
+        };
+        let saved = state.save();
+        // On ordinary SDR frames the renderer defaults are already passthrough. Only the
+        // uniform state changes, so sequential captures need no new programs or transforms.
+        if saved.0 {
+            set_frame_blend_tty(self, None);
         }
+        match self {
+            TtyRenderer::Gles(multi) => {
+                FrameBlendState::get(multi.as_mut()).set_sdr_capture_values(reference_luminance)
+            }
+            TtyRenderer::Vulkan(multi) => multi
+                .as_mut()
+                .user_data()
+                .get::<FrameBlendState>()
+                .unwrap()
+                .set_sdr_capture_values(reference_luminance),
+        }
+        let result = capture(self);
+        if saved.0 {
+            set_frame_blend_tty(
+                self,
+                Some((f64::from(saved.1) * 10000., f64::from(saved.2))),
+            );
+        }
+        match self {
+            TtyRenderer::Gles(multi) => FrameBlendState::get(multi.as_mut()).restore(saved),
+            TtyRenderer::Vulkan(multi) => multi
+                .as_mut()
+                .user_data()
+                .get::<FrameBlendState>()
+                .unwrap()
+                .restore(saved),
+        }
+        result
     }
 }
 

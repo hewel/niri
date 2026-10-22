@@ -1,5 +1,5 @@
 use std::array;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
@@ -12,9 +12,11 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blend::FrameBlendState;
-use crate::render_helpers::effect_buffer::EffectBuffer;
+use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::effect_buffer::{EffectBuffer, XrayElementStore};
 use crate::render_helpers::liquid_glass::{GlassRequest, PreparedBackground};
 use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
 use crate::render_helpers::shader_element::uniform_to_custom_owned;
@@ -25,10 +27,60 @@ use crate::utils::region::TransformedRegion;
 #[derive(Debug)]
 pub struct Xray {
     // The buffers are per-render-target to avoid constant rerendering when screencasting.
-    pub background: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
-    pub backdrop: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
+    background: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
+    backdrop: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
+    frame_active: Cell<bool>,
+    snapshot_target: Cell<Option<RenderTarget>>,
     pub backdrop_color: Color32F,
     pub workspaces: Vec<(Rectangle<f64, Logical>, Color32F)>,
+}
+
+/// Keeps scene elements alive until all immediate xray consumers have prepared their captures.
+/// Cached textures and presentation feedback remain available after the scope ends.
+#[must_use = "keep the xray frame alive until immediate consumers have prepared their captures"]
+pub struct XrayFrame<'a> {
+    xray: &'a Xray,
+}
+
+struct SnapshotRoute<'a> {
+    target: &'a Cell<Option<RenderTarget>>,
+    previous: Option<RenderTarget>,
+}
+
+impl Drop for SnapshotRoute<'_> {
+    fn drop(&mut self) {
+        self.target.set(self.previous);
+    }
+}
+
+impl XrayFrame<'_> {
+    /// Populates the background and backdrop for one render target.
+    pub fn populate<R: XrayElementStore>(
+        &self,
+        target: RenderTarget,
+        mut populate: impl FnMut(bool, &mut Vec<LayerSurfaceRenderElement<R>>),
+    ) {
+        for (for_backdrop, buffer) in [
+            (false, &self.xray.background[target as usize]),
+            (true, &self.xray.backdrop[target as usize]),
+        ] {
+            let mut buffer = buffer.borrow_mut();
+            let elements = buffer.elements::<R>();
+            elements.clear();
+            populate(for_backdrop, elements);
+            // Avoid unused capacity remaining forever.
+            elements.shrink_to_fit();
+        }
+    }
+}
+
+impl Drop for XrayFrame<'_> {
+    fn drop(&mut self) {
+        for buffer in self.xray.background.iter().chain(&self.xray.backdrop) {
+            buffer.borrow_mut().clear_elements();
+        }
+        self.xray.frame_active.set(false);
+    }
 }
 
 /// Position for drawing xray background.
@@ -89,9 +141,66 @@ impl Xray {
         Self {
             background: array::from_fn(|_| Rc::new(RefCell::new(EffectBuffer::new()))),
             backdrop: array::from_fn(|_| Rc::new(RefCell::new(EffectBuffer::new()))),
+            frame_active: Cell::new(false),
+            snapshot_target: Cell::new(None),
             backdrop_color: Color32F::TRANSPARENT,
             workspaces: Vec::new(),
         }
+    }
+
+    pub fn update(
+        &mut self,
+        size: Size<i32, Physical>,
+        scale: Scale<f64>,
+        blur_options: BlurOptions,
+    ) {
+        for buffer in self.background.iter().chain(&self.backdrop) {
+            let mut buffer = buffer.borrow_mut();
+            buffer.update_size(size, scale);
+            buffer.update_blur_options(blur_options);
+        }
+    }
+
+    pub fn frame(&self) -> XrayFrame<'_> {
+        assert!(!self.frame_active.replace(true), "nested xray frame");
+        XrayFrame { xray: self }
+    }
+
+    /// Uses the capture-safe background while baking a snapshot, without changing the
+    /// window's render target. When no layers are sensitive, reuse the output capture.
+    /// The normal target selection is restored even on an early return or unwind.
+    pub fn with_snapshot_background<T>(
+        &self,
+        has_blocked_out_layers: bool,
+        render: impl FnOnce(&Self) -> T,
+    ) -> T {
+        let target = if has_blocked_out_layers {
+            RenderTarget::Screencast
+        } else {
+            RenderTarget::Output
+        };
+        let _route = SnapshotRoute {
+            target: &self.snapshot_target,
+            previous: self.snapshot_target.replace(Some(target)),
+        };
+        render(self)
+    }
+
+    /// Finds the effect element that presented a background surface in the last capture.
+    pub fn presented_background_id(&self, target: RenderTarget, surface: &Id) -> Option<Id> {
+        for buffer in [
+            &self.background[target as usize],
+            &self.backdrop[target as usize],
+        ] {
+            let buffer = buffer.borrow();
+            if buffer
+                .render_element_states()
+                .is_some_and(|states| states.element_was_presented(surface.clone()))
+            {
+                return Some(buffer.id().clone());
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -108,6 +217,7 @@ impl Xray {
         push: &mut dyn FnMut(XrayElement),
     ) {
         let zoom = xray_pos.zoom;
+        let target = self.snapshot_target.get().unwrap_or(ctx.target) as usize;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);
 
         let (clip_geo, corner_radius) = params
@@ -119,13 +229,13 @@ impl Xray {
 
         let geo_in_backdrop = Rectangle::new(pos_in_backdrop, params.geometry.size.upscale(zoom));
 
-        let mut backdrop = self.backdrop[ctx.target as usize].borrow_mut();
+        let mut backdrop = self.backdrop[target].borrow_mut();
         let backdrop_geo = Rectangle::from_size(backdrop.logical_size());
         let intersection_with_backdrop = backdrop_geo.intersection(geo_in_backdrop);
 
         let mut skip_backdrop = intersection_with_backdrop.is_none();
 
-        let mut background = self.background[ctx.target as usize].borrow_mut();
+        let mut background = self.background[target].borrow_mut();
         let prev = background.commit();
         let prepared = PreparedBackground::prepare(
             &mut background,
@@ -196,7 +306,7 @@ impl Xray {
                 geometry.loc += params.geometry.loc;
 
                 let elem = XrayElement {
-                    buffer: self.background[ctx.target as usize].clone(),
+                    buffer: self.background[target].clone(),
                     id: background.id().clone(),
                     geometry,
                     src,
@@ -253,7 +363,7 @@ impl Xray {
                 * Mat3::from_translation(-clip_pos_in_backdrop / buf_size);
 
             let elem = XrayElement {
-                buffer: self.backdrop[ctx.target as usize].clone(),
+                buffer: self.backdrop[target].clone(),
                 id: backdrop.id().clone(),
                 geometry: params.geometry,
                 src,

@@ -8,6 +8,7 @@ mod test_input_backend;
 
 mod animations;
 mod binds;
+mod capture_blend;
 mod color_management;
 mod floating;
 mod fullscreen;
@@ -21,4 +22,5 @@ mod suspended;
 mod transactions;
 mod virtual_pointer;
 mod window_opening;
+mod window_unmap;
 mod xdg_decoration;

@@ -37,8 +37,7 @@ use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::{AnyStartData, DOUBLE_CLICK_TIME};
 use crate::layout::ActivateWindow;
-use crate::niri::{CastTarget, PopupGrabState, State};
-use crate::utils::transaction::Transaction;
+use crate::niri::{PopupGrabState, State, WindowUnmap};
 use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
 };
@@ -924,43 +923,7 @@ impl XdgShellHandler for State {
         let output = output.cloned();
 
         let id = mapped.id();
-        self.niri
-            .stop_casts_for_target(CastTarget::Window { id: id.get() });
-
-        self.store_unmap_snapshot(&window, output.as_ref());
-
-        let transaction = Transaction::new();
-        let blocker = transaction.blocker();
-        crate::with_primary_renderer_any!(self.backend, |renderer| {
-            self.niri
-                .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
-        });
-
-        let active_window = self.niri.layout.focus().map(|m| &m.window);
-        let was_active = active_window == Some(&window);
-
-        self.niri.window_mru_ui.remove_window(id);
-        self.niri.layout.remove_window(&window, transaction.clone());
-
-        // Unlike upstream, the default dmabuf pre-commit hook stays installed for mapped
-        // toplevels (buffer readiness always comes from its immediate blockers, see
-        // add_mapped_toplevel_pre_commit_hook), so there is nothing to re-add here.
-
-        // If this is the only instance, then this transaction will complete immediately, so no
-        // need to set the timer.
-        if !transaction.is_last() {
-            transaction.register_deadline_timer(&self.niri.event_loop, &self.niri.display_handle);
-        }
-
-        if was_active {
-            self.maybe_warp_cursor_to_focus();
-        }
-
-        if let Some(output) = output {
-            self.niri.queue_redraw(&output);
-            self.niri.queue_redraw_mru_output();
-        }
+        self.unmap_window(window, id, output, WindowUnmap::Destroyed);
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {

@@ -4993,7 +4993,7 @@ impl<W: LayoutElement> Layout<W> {
     pub fn store_unmap_snapshot<R: NiriCaptureRenderer>(
         &mut self,
         renderer: &mut R,
-        xray: Option<&mut Xray>,
+        xray: Option<&Xray>,
         xray_has_blocked_out_layers: bool,
         window: &W::Id,
     ) where

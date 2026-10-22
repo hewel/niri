@@ -19,7 +19,6 @@ use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::texture::{TextureBuffer, TextureRenderElement, UniversalTextureRenderElement};
 use crate::backend::tty_renderer::TtyOffscreen;
-use crate::render_helpers::blend::set_sdr_capture_blend;
 use crate::render_helpers::renderer::{
     AsGlesRenderer, AsVulkanRenderer, HasOffscreen, NiriCaptureRenderer, NiriRenderer,
 };
@@ -325,19 +324,19 @@ where
     Ok(copy.to_vec())
 }
 
+/// Writes prepared capture elements into a DMA-BUF. The caller owns the
+/// [`blend::with_sdr_capture`] scope covering both their preparation and this write.
 pub fn render_to_dmabuf<R: NiriCaptureRenderer>(
     renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
     elements: &[impl RenderElement<R>],
     states: RenderElementStates,
-    reference_luminance: f64,
 ) -> anyhow::Result<SyncPoint>
 where
     R::Error: Send + Sync + 'static,
 {
     let _span = tracy_client::span!();
-    set_sdr_capture_blend(renderer, reference_luminance);
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     ensure!(
         dmabuf.width() == size.w as u32 && dmabuf.height() == size.h as u32,
@@ -358,6 +357,8 @@ where
     Ok(res.sync)
 }
 
+/// Writes prepared capture elements into client SHM without changing color state.
+/// The caller owns the [`blend::with_sdr_capture`] scope starting before preparation.
 pub fn render_to_shm<R: NiriCaptureRenderer>(
     renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
@@ -365,13 +366,11 @@ pub fn render_to_shm<R: NiriCaptureRenderer>(
     format: wl_shm::Format,
     elements: &[impl RenderElement<R>],
     states: RenderElementStates,
-    reference_luminance: f64,
 ) -> anyhow::Result<()>
 where
     R::Error: Send + Sync + 'static,
 {
     let _span = tracy_client::span!();
-    set_sdr_capture_blend(renderer, reference_luminance);
     // The pointer and length are the client's entire pool, which may hold other
     // buffers besides this one... buffer_data is the one we want.
     shm::with_buffer_contents_mut(buffer, |pool, pool_len, buffer_data| {

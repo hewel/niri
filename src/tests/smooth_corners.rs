@@ -197,18 +197,26 @@ fn smooth_glass_border_and_shadow_share_mask_in_sdr_and_hdr() {
             );
             let mut xray = Xray::new();
             xray.workspaces.push((geometry(), Color32F::TRANSPARENT));
-            for buffer in [&xray.background[0]] {
-                let mut buffer = buffer.borrow_mut();
-                buffer.update_size(
-                    geometry().size.to_physical_precise_round(scale),
-                    Scale::from(scale),
-                );
-                let solid = SolidColorBuffer::new(geometry().size, [1., 1., 1., 1.]);
-                buffer.elements::<GlesRenderer>().push(
-                    SolidColorRenderElement::from_buffer(&solid, (0., 0.), 1., Kind::Unspecified)
+            xray.update(
+                geometry().size.to_physical_precise_round(scale),
+                Scale::from(scale),
+                Default::default(),
+            );
+            let frame = xray.frame();
+            frame.populate::<GlesRenderer>(RenderTarget::Output, |for_backdrop, elements| {
+                if !for_backdrop {
+                    let solid = SolidColorBuffer::new(geometry().size, [1., 1., 1., 1.]);
+                    elements.push(
+                        SolidColorRenderElement::from_buffer(
+                            &solid,
+                            (0., 0.),
+                            1.,
+                            Kind::Unspecified,
+                        )
                         .into(),
-                );
-            }
+                    );
+                }
+            });
             let mut effect = BackgroundEffect::new();
             effect.update_render_elements(
                 corner,

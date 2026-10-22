@@ -1,6 +1,6 @@
 # Personal changes: ownership and regression checks
 
-The three refactors start after `a19074380b26899b67e8c9dbcc22aa315a3fdea4`.
+The first three refactors start after `a19074380b26899b67e8c9dbcc22aa315a3fdea4`.
 They keep the spicy and Smithay revisions in [versions.env](versions.env), the public
 KDL settings, and the accepted visual behavior. They do not widen Glass support.
 
@@ -15,7 +15,9 @@ The implementation commits, in order:
 | Daily installation and rollback | `scripts/personal-deploy.py` | Explicit accepted artifact; stage and validate those bytes, publish a complete immutable bundle, then atomically select it for the next login |
 | Session startup | Stable launcher plus bundle's `session.sh` | Pin one bundle through migration, validation and systemd startup; do not change an active desktop |
 | Glass eligibility and background preparation | `render_helpers/liquid_glass.rs` | Resolve a request, prepare its background, return a shader with matching parameters or preserve ordinary fallback |
-| Xray placement and drawing | `render_helpers/xray.rs` | Use the prepared background while retaining transforms, clipping, damage and backend dispatch |
+| Xray placement, target isolation and scene lifetime | `render_helpers/xray.rs` | Populate through a frame scope; request capture-safe snapshot routing without accessing target buffers |
+| SDR capture color operation | `render_helpers/blend.rs` | Scope scene preparation and buffer writes together; restore normal frame state on success or returned error |
+| Window unmap | `State::unmap_window` in `niri.rs` | Identify null-buffer removal or toplevel destruction; preserve their distinct snapshot and remap ordering |
 | Smooth corner contour | `shaders/rounding_alpha.frag` | Own fitted geometry, cubic/arc intersections and row spans; shadow owns Gaussian integration |
 
 ## Daily deployment
@@ -65,6 +67,57 @@ color conversion retain their existing formulas.
 Six soft-shadow PNG references record the rendering before extraction. Their
 `source.json` explicitly identifies them as regression references, not an independent
 proof of the Gaussian approximation. Independent pinned Lisse path tests remain.
+
+## Xray frame and snapshot target
+
+The next three refactors start after `1a2305913fb59cafab15ee7d689627c05ce8a7f8`.
+They retain the pinned Smithay, visual settings and protocol behavior.
+
+The Xray module owns its per-target background/backdrop buffers. `XrayFrame` ties
+temporary layer elements to one render or snapshot operation; dropping the frame
+clears those elements across every target but retains prepared textures, presentation
+feedback and allocated capacity. Niri supplies the scene without owning buffer layout.
+
+Closing snapshots use `with_snapshot_background` to select a capture-safe background
+independently of the window's own capture target. The route is restored on scope exit,
+including errors and unwinding. Tile no longer swaps buffer pointers, and emitted
+elements retain the selected buffer after routing is restored. Capture-blocked layers
+must remain blocked when sampled through effects and closing animations.
+
+## SDR capture operation
+
+`with_sdr_capture` covers renderer-dependent scene and pointer preparation through
+the final capture write. Screenshot selection scopes each source output separately;
+screen/window screenshots, screencopy, image-copy capture and PipeWire use the same
+operation. Privacy targets remain independent of color state and storage format.
+
+GLES, Vulkan and TTY adapters restore the exact saved normal niri frame state,
+including nondefault SDR reference white and HDR peak, after success or a returned
+error. This is not an arbitrary Smithay override guard, and it does not promise
+restoration after panic unwinding. The operation runs between frames, outside
+per-content draw overrides. Ordinary SDR captures do not rebuild renderer defaults.
+Output PipeWire streams share one prepared scene and color scope once a stream is
+ready; inactive or not-yet-due streams do not trigger capture preparation.
+
+The interface is the test surface: real Wayland HDR content is rendered and read
+back through GLES and Vulkan across sequential captures, nested SDR scopes and
+unsupported framebuffer-format errors. These are renderer checks, not physical HDR
+display or complete portal-session acceptance.
+
+## Window unmap
+
+`State::unmap_window` owns closing-animation setup, cast shutdown, MRU removal,
+layout removal, transaction deadline registration, focus handling and redraws.
+Protocol handlers identify the event rather than repeating this sequence:
+
+- Null-buffer removal starts the closing animation before applying `Window::on_commit`,
+  then retains the toplevel as `Unmapped` for a fresh configure/remap handshake.
+- Toplevel destruction stops its casts and snapshots the last contents before starting
+  the closing animation; it does not retain an unmapped toplevel.
+
+This keeps ordering in one module without widening the layout interface. Protocol
+regressions cover MRU/focus after both events and the null-buffer remap handshake;
+the existing real-renderer closing-animation test continues to cover snapshot use.
 
 ## Repeat the checks
 

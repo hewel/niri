@@ -201,13 +201,12 @@ impl HasOffscreen for smithay::backend::renderer::vulkan::VulkanRenderer {
 
 /// Renderer bounds needed by the generic capture helpers (screenshots, screencopy,
 /// screencasting): offscreen render targets of the renderer's own texture type plus the
-/// SDR-capture blend control.
+/// scoped SDR capture color operation.
 pub trait NiriCaptureRenderer:
     NiriRenderer
     + HasOffscreen
     + Offscreen<<Self as HasOffscreen>::Offscreen>
     + Bind<<Self as HasOffscreen>::Offscreen>
-    + crate::render_helpers::blend::CaptureBlend
 {
 }
 
@@ -216,6 +215,5 @@ impl<R> NiriCaptureRenderer for R where
         + HasOffscreen
         + Offscreen<<R as HasOffscreen>::Offscreen>
         + Bind<<R as HasOffscreen>::Offscreen>
-        + crate::render_helpers::blend::CaptureBlend
 {
 }

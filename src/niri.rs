@@ -179,7 +179,7 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::render_helpers::blend::{
-    scanout_color_transform, set_sdr_capture_blend, BlendSurfaceRenderElement, ContentColor,
+    scanout_color_transform, with_sdr_capture, BlendSurfaceRenderElement, ContentColor,
     DEFAULT_REFERENCE_LUMINANCE,
 };
 use crate::render_helpers::blur::BlurOptions;
@@ -205,7 +205,7 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
-use crate::utils::transaction::SurfaceBarriers;
+use crate::utils::transaction::{SurfaceBarriers, Transaction};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
@@ -669,6 +669,15 @@ pub enum CenterCoords {
     Both,
     // Force centering even if the cursor is already in the rectangle.
     BothAlways,
+}
+
+/// The protocol event ending a mapped window's lifetime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WindowUnmap {
+    /// Apply the null-buffer commit after preserving the closing animation.
+    BufferRemoved,
+    /// Snapshot the last contents before removing the destroyed toplevel.
+    Destroyed,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2541,6 +2550,66 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Completes a mapped window's departure, including protocol-specific snapshot timing.
+    pub fn unmap_window(
+        &mut self,
+        window: Window,
+        id: MappedId,
+        output: Option<Output>,
+        reason: WindowUnmap,
+    ) {
+        if reason == WindowUnmap::Destroyed {
+            self.niri
+                .stop_casts_for_target(CastTarget::Window { id: id.get() });
+            self.store_unmap_snapshot(&window, output.as_ref());
+        }
+
+        let transaction = Transaction::new();
+        let blocker = transaction.blocker();
+        crate::with_primary_renderer_any!(self.backend, |renderer| {
+            self.niri
+                .layout
+                .start_close_animation_for_window(renderer, &window, blocker);
+        });
+
+        if reason == WindowUnmap::BufferRemoved {
+            // on_commit drops the old contents, so the animation must already own its snapshot.
+            window.on_commit();
+        }
+
+        let was_active = self.niri.layout.focus().map(|m| &m.window) == Some(&window);
+        if reason == WindowUnmap::BufferRemoved {
+            self.niri
+                .stop_casts_for_target(CastTarget::Window { id: id.get() });
+        }
+        self.niri.window_mru_ui.remove_window(id);
+        self.niri.layout.remove_window(&window, transaction.clone());
+
+        // An unshared transaction completes immediately and needs no deadline.
+        if !transaction.is_last() {
+            transaction.register_deadline_timer(&self.niri.event_loop, &self.niri.display_handle);
+        }
+        if was_active {
+            self.maybe_warp_cursor_to_focus();
+        }
+
+        if reason == WindowUnmap::BufferRemoved {
+            // Remapping the retained toplevel requires a new initial commit/configure handshake.
+            let surface = window
+                .toplevel()
+                .expect("no x11 support")
+                .wl_surface()
+                .clone();
+            self.niri
+                .unmapped_windows
+                .insert(surface, Unmapped::new(window));
+        }
+        if let Some(output) = output {
+            self.niri.queue_redraw(&output);
+            self.niri.queue_redraw_mru_output();
+        }
+    }
+
     pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
         // The unmapping tile may have an xray background, in which case we will render xray
         // elements, so they need to be updated.
@@ -2548,6 +2617,8 @@ impl State {
 
         crate::with_primary_renderer_any!(self.backend, |renderer| {
             if let Some(output) = output {
+                let state = self.niri.output_state.get(output).unwrap();
+                let frame = state.xray.frame();
                 let mut ctx = RenderCtx {
                     target: RenderTarget::Output,
                     renderer,
@@ -2555,9 +2626,9 @@ impl State {
                 };
 
                 if let Some(gles_ctx) = ctx.as_gles() {
-                    self.niri.fill_xray_elements(gles_ctx, output);
+                    self.niri.populate_xray_elements(gles_ctx, output, &frame);
                 } else if let Some(vk_ctx) = ctx.as_vulkan() {
-                    self.niri.fill_xray_elements(vk_ctx, output);
+                    self.niri.populate_xray_elements(vk_ctx, output, &frame);
                 }
 
                 // If any background layer has block_out_from, also fill the Screencast xray
@@ -2571,22 +2642,19 @@ impl State {
                         ..ctx.r()
                     };
                     if let Some(gles_ctx) = screencast_ctx.as_gles() {
-                        self.niri.fill_xray_elements(gles_ctx, output);
+                        self.niri.populate_xray_elements(gles_ctx, output, &frame);
                     } else if let Some(vk_ctx) = screencast_ctx.as_vulkan() {
-                        self.niri.fill_xray_elements(vk_ctx, output);
+                        self.niri.populate_xray_elements(vk_ctx, output, &frame);
                     }
                 }
 
                 let renderer = ctx.renderer;
-                let state = self.niri.output_state.get_mut(output).unwrap();
                 self.niri.layout.store_unmap_snapshot(
                     renderer,
-                    Some(&mut state.xray),
+                    Some(&state.xray),
                     has_blocked_out,
                     window,
                 );
-
-                self.niri.clear_xray_elements(output);
             } else {
                 self.niri
                     .layout
@@ -5045,16 +5113,7 @@ impl Niri {
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
                 let blur_options = BlurOptions::from(self.config.borrow().blur);
-                for buf in &state.xray.background {
-                    let mut buffer = buf.borrow_mut();
-                    buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
-                }
-                for buf in &state.xray.backdrop {
-                    let mut buffer = buf.borrow_mut();
-                    buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
-                }
+                state.xray.update(size, scale, blur_options);
 
                 let layer_map = layer_map_for_output(out);
                 for surface in layer_map.layers_on(Layer::Background) {
@@ -5125,20 +5184,19 @@ impl Niri {
             }
         }
 
+        let state = self.output_state.get(output).unwrap();
+        let frame = state.xray.frame();
         if let Some(gles_ctx) = ctx.as_gles() {
-            self.fill_xray_elements(gles_ctx, output);
+            self.populate_xray_elements(gles_ctx, output, &frame);
         } else if let Some(vk_ctx) = ctx.as_vulkan() {
-            self.fill_xray_elements(vk_ctx, output);
+            self.populate_xray_elements(vk_ctx, output, &frame);
         }
 
         // Reborrow to shorten lifetime to be able to put in xray.
         let mut ctx = ctx.r();
-        let state = self.output_state.get(output).unwrap();
         ctx.xray = Some(&state.xray);
 
         self.render_inner(ctx, output, include_pointer, push);
-
-        self.clear_xray_elements(output);
     }
 
     fn render_inner<R: NiriRenderer>(
@@ -5397,79 +5455,35 @@ impl Niri {
         push(backdrop);
     }
 
-    pub fn fill_xray_elements<R>(&self, mut ctx: RenderCtx<R>, output: &Output)
-    where
+    fn populate_xray_elements<R>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        frame: &crate::render_helpers::xray::XrayFrame<'_>,
+    ) where
         R: NiriRenderer + crate::render_helpers::effect_buffer::XrayElementStore,
         LayerSurfaceRenderElement<R>: RenderElement<R>,
     {
-        let _span = tracy_client::span!("Niri::fill_xray_elements");
+        let _span = tracy_client::span!("Niri::populate_xray_elements");
 
         // Make sure the xrayed elements themselves cannot use xray by mistake.
         ctx.xray = None;
 
-        let state = self.output_state.get(output).unwrap();
-        let xray = &state.xray;
         let layer_map = layer_map_for_output(output);
 
-        // FIXME: it would be cool to call this code on-demand. It's even relatively simple to do:
-        // move this function to after the render_inner() call, check if
-        // Rc::strong_count(&xray.background) > 1, and only then construct the elements. This way,
-        // only if something referenced the xray buffer will the elements get constructed.
-        //
-        // Unfortunately, currently this runs into an important limitation: offscreens are rendered
-        // immediately deep inside render_inner(), and when they are, they already need the xray
-        // elements filled.
-        //
-        // Perhaps in the future when offscreen rendering becomes on-demand, this optimization will
-        // be possible.
-
-        let mut buffer = xray.background[ctx.target as usize].borrow_mut();
-        {
-            let elements = buffer.elements::<R>();
-            elements.clear();
+        // Offscreens render immediately inside render_inner(), so populate the scene before
+        // any consumers can request a capture.
+        frame.populate::<R>(ctx.target, |for_backdrop, elements| {
             self.render_layer_normal(
                 ctx.r(),
                 None,
                 &layer_map,
                 Layer::Background,
                 XrayPos::default(),
-                false,
+                for_backdrop,
                 &mut |elem| elements.push(elem),
             );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-
-        let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
-        {
-            let elements = buffer.elements::<R>();
-            elements.clear();
-            self.render_layer_normal(
-                ctx.r(),
-                None,
-                &layer_map,
-                Layer::Background,
-                XrayPos::default(),
-                true,
-                &mut |elem| elements.push(elem),
-            );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-    }
-
-    pub fn clear_xray_elements(&self, output: &Output) {
-        let state = self.output_state.get(output).unwrap();
-        let xray = &state.xray;
-
-        // Clear the xray elements for all render targets after all rendering that could use them
-        // did so.
-        for buf in &xray.background {
-            buf.borrow_mut().clear_elements();
-        }
-        for buf in &xray.backdrop {
-            buf.borrow_mut().clear_elements();
-        }
+        });
     }
 
     /// Checks if any background layer surface has `block_out_from` set.
@@ -5870,8 +5884,6 @@ impl Niri {
         }
 
         let xray = &self.output_state[output].xray;
-        let xray_bg = xray.background[RenderTarget::Output as usize].borrow();
-        let xray_bd = xray.backdrop[RenderTarget::Output as usize].borrow();
 
         for layer in layer_map_for_output(output).layers() {
             let surface = layer.wl_surface();
@@ -5891,17 +5903,9 @@ impl Niri {
                 // an xray background during its opening animation). But hopefully with the
                 // refactor to draw background effects outside offscreens it won't be a problem.
                 if is_background && !render_element_states.element_was_presented(id.clone()) {
-                    // A layer may be present either in background or backdrop, never in both.
-                    if xray_bg
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
+                    if let Some(presented) = xray.presented_background_id(RenderTarget::Output, &id)
                     {
-                        id = xray_bg.id().clone();
-                    } else if xray_bd
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
-                    {
-                        id = xray_bd.id().clone();
+                        id = presented;
                     }
                 }
 
@@ -6365,72 +6369,72 @@ impl Niri {
     {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
 
+        let reference_luminance = self.output_capture_reference_luminance(output);
         let mut screencopy_state = mem::take(&mut self.screencopy_state);
 
         screencopy_state.with_queues_mut(|queue| {
-            let (damage_tracker, screencopy) = queue.split();
-            if let Some(screencopy) = screencopy {
-                if screencopy.output() == output {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target: RenderTarget::ScreenCapture,
-                        xray: None,
-                    };
-                    let offset = screencopy.region_loc().upscale(-1);
-                    let mut elements = Vec::new();
-                    self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
-                        let elem =
-                            RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
-                        elements.push(elem);
+            if !queue
+                .split()
+                .1
+                .is_some_and(|screencopy| screencopy.output() == output)
+            {
+                return;
+            }
+            with_sdr_capture(renderer, reference_luminance, |renderer| {
+                let (damage_tracker, screencopy) = queue.split();
+                let screencopy = screencopy.unwrap();
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                };
+                let offset = screencopy.region_loc().upscale(-1);
+                let mut elements = Vec::new();
+                self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
+                    let elem =
+                        RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
+                    elements.push(elem);
+                });
+
+                let (damages, states) =
+                    Self::damage_screencopy_internal(output, &elements, damage_tracker, screencopy);
+                if let Some(damages) = damages {
+                    // Convert from Physical coordinates back to Buffer coordinates.
+                    let transform = output.current_transform();
+                    let physical_size = transform.transform_size(screencopy.buffer_size());
+                    let damages = damages.iter().map(|dmg| {
+                        dmg.to_logical(1).to_buffer(
+                            1,
+                            transform.invert(),
+                            &physical_size.to_logical(1),
+                        )
                     });
 
-                    let (damages, states) = Self::damage_screencopy_internal(
-                        output,
-                        &elements,
+                    screencopy.damage(damages);
+
+                    let render_result = Self::render_for_screencopy_internal(
+                        renderer,
                         damage_tracker,
+                        &elements,
+                        states,
                         screencopy,
                     );
-                    if let Some(damages) = damages {
-                        // Convert from Physical coordinates back to Buffer coordinates.
-                        let transform = output.current_transform();
-                        let physical_size = transform.transform_size(screencopy.buffer_size());
-                        let damages = damages.iter().map(|dmg| {
-                            dmg.to_logical(1).to_buffer(
-                                1,
-                                transform.invert(),
-                                &physical_size.to_logical(1),
-                            )
-                        });
-
-                        screencopy.damage(damages);
-
-                        let reference_luminance =
-                            self.output_capture_reference_luminance(screencopy.output());
-                        let render_result = Self::render_for_screencopy_internal(
-                            renderer,
-                            damage_tracker,
-                            &elements,
-                            states,
-                            screencopy,
-                            reference_luminance,
-                        );
-                        match render_result {
-                            Ok(sync) => {
-                                queue.pop().submit_after_sync(false, sync, &self.event_loop);
-                            }
-                            Err(err) => {
-                                // Recreate damage tracker to report full damage next check.
-                                *damage_tracker =
-                                    OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
-                                queue.pop();
-                                warn!("error rendering for screencopy: {err:?}");
-                            }
+                    match render_result {
+                        Ok(sync) => {
+                            queue.pop().submit_after_sync(false, sync, &self.event_loop);
                         }
-                    } else {
-                        trace!("no damage found, waiting till next redraw");
+                        Err(err) => {
+                            // Recreate damage tracker to report full damage next check.
+                            *damage_tracker =
+                                OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+                            queue.pop();
+                            warn!("error rendering for screencopy: {err:?}");
+                        }
                     }
-                };
-            }
+                } else {
+                    trace!("no damage found, waiting till next redraw");
+                }
+            });
         });
 
         self.screencopy_state = screencopy_state;
@@ -6461,42 +6465,43 @@ impl Niri {
 
         self.update_render_elements(Some(output));
 
-        let ctx = RenderCtx {
-            renderer,
-            target: RenderTarget::ScreenCapture,
-            xray: None,
-        };
-        let offset = screencopy.region_loc().upscale(-1);
-        let mut elements = Vec::new();
-        self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
-            let elem = RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
-            elements.push(elem);
-        });
-
         let reference_luminance = self.output_capture_reference_luminance(output);
-        let Some(damage_tracker) = self.screencopy_state.damage_tracker(manager) else {
-            error!("screencopy queue must not be deleted as long as frames exist");
-            bail!("screencopy queue missing");
-        };
+        with_sdr_capture(renderer, reference_luminance, |renderer| {
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::ScreenCapture,
+                xray: None,
+            };
+            let offset = screencopy.region_loc().upscale(-1);
+            let mut elements = Vec::new();
+            self.render(ctx, output, screencopy.overlay_cursor(), &mut |elem| {
+                let elem = RelocateRenderElement::from_element(elem, offset, Relocate::Relative);
+                elements.push(elem);
+            });
 
-        let (_damages, states) =
-            Self::damage_screencopy_internal(output, &elements, damage_tracker, &screencopy);
-        let res = Self::render_for_screencopy_internal(
-            renderer,
-            damage_tracker,
-            &elements,
-            states,
-            &screencopy,
-            reference_luminance,
-        );
-        let res = res.map(|sync| screencopy.submit_after_sync(false, sync, &self.event_loop));
+            let Some(damage_tracker) = self.screencopy_state.damage_tracker(manager) else {
+                error!("screencopy queue must not be deleted as long as frames exist");
+                bail!("screencopy queue missing");
+            };
 
-        if res.is_err() {
-            // Recreate damage tracker to report full damage next check.
-            *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
-        }
+            let (_damages, states) =
+                Self::damage_screencopy_internal(output, &elements, damage_tracker, &screencopy);
+            let res = Self::render_for_screencopy_internal(
+                renderer,
+                damage_tracker,
+                &elements,
+                states,
+                &screencopy,
+            );
 
-        res
+            if res.is_err() {
+                // Recreate damage tracker to report full damage next check.
+                *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+            }
+
+            res
+        })
+        .map(|sync| screencopy.submit_after_sync(false, sync, &self.event_loop))
     }
 
     pub fn render_for_image_copy_capture<R: NiriCaptureRenderer>(
@@ -6518,140 +6523,146 @@ impl Niri {
         };
 
         let _span = tracy_client::span!("Niri::render_for_image_copy_capture");
+        if !self.image_copy_sessions.iter().any(|s| {
+            s.pending_frame.is_some()
+                && image_copy_capture_impl::source_output(&s.session.source()).as_ref()
+                    == Some(output)
+        }) {
+            return;
+        }
 
         let size = mode.size;
         let scale: Scale<f64> = output.current_scale().fractional_scale().into();
         let transform = output.current_transform();
         let reference_luminance = self.output_capture_reference_luminance(output);
+        with_sdr_capture(renderer, reference_luminance, |renderer| {
+            // Sessions with a single output only differ by whether they capture the
+            // cursor, so at most two renders are needed regardless of how many
+            // clients are capturing.
+            let mut cached_elements: [Option<Vec<_>>; 2] = [None, None];
 
-        // Sessions with a single output only differ by whether they capture the
-        // cursor, so at most two renders are needed regardless of how many
-        // clients are capturing.
-        let mut cached_elements: [Option<Vec<_>>; 2] = [None, None];
-
-        let mut sessions = mem::take(&mut self.image_copy_sessions);
-        for s in &mut sessions {
-            // Cheapest check first.
-            if s.pending_frame.is_none() {
-                continue;
-            }
-
-            let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source()) else {
-                continue;
-            };
-            if s_output != *output {
-                continue;
-            }
-
-            // Recreate the damage tracker if the output changed.
-            let OutputModeSource::Static {
-                size: last_size,
-                scale: last_scale,
-                transform: last_transform,
-            } = s.damage_tracker.mode().clone()
-            else {
-                unreachable!("damage tracker must have static mode");
-            };
-            if size != last_size || scale != last_scale || transform != last_transform {
-                s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
-            }
-
-            let draw_cursor = s.session.draw_cursor();
-            let cached = &mut cached_elements[usize::from(draw_cursor)];
-            let elements = cached.get_or_insert_with(|| {
-                let ctx = RenderCtx {
-                    renderer: &mut *renderer,
-                    target: RenderTarget::ScreenCapture,
-                    xray: None,
-                };
-                let mut elements = Vec::new();
-                self.render(ctx, output, draw_cursor, &mut |elem| {
-                    elements.push(elem);
-                });
-                elements
-            });
-
-            let (damage, states) = s.damage_tracker.damage_output(1, elements).unwrap();
-            let Some(damage) = damage else {
-                // No damage, capture the frame later.
-                continue;
-            };
-
-            // Convert from Physical coordinates back to Buffer coordinates.
-            let physical_size = transform.transform_size(size);
-            let damage: Vec<Rectangle<i32, BufferCoords>> = damage
-                .iter()
-                .map(|dmg| {
-                    dmg.to_logical(1)
-                        .to_buffer(1, transform.invert(), &physical_size.to_logical(1))
-                })
-                .collect();
-
-            let frame = s.pending_frame.take().unwrap();
-            let buffer = frame.buffer();
-            let buffer_size = Size::<i32, BufferCoords>::from((size.w, size.h));
-            let capture_buffer = image_copy_capture_impl::capture_buffer(
-                &buffer,
-                buffer_size,
-                wl_shm::Format::Xrgb8888,
-            );
-            let Some(capture_buffer) = capture_buffer else {
-                frame.fail(CaptureFailureReason::BufferConstraints);
-                // Report full damage next time.
-                s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
-                continue;
-            };
-
-            let res = match capture_buffer {
-                CaptureBuffer::Dma(dmabuf) => render_to_dmabuf(
-                    renderer,
-                    &mut s.damage_tracker,
-                    dmabuf,
-                    elements,
-                    states,
-                    reference_luminance,
-                )
-                .map(Some),
-                CaptureBuffer::Shm => render_to_shm(
-                    renderer,
-                    &mut s.damage_tracker,
-                    &buffer,
-                    wl_shm::Format::Xrgb8888,
-                    elements,
-                    states,
-                    reference_luminance,
-                )
-                .map(|()| None),
-            };
-
-            match res {
-                Ok(sync) => {
-                    image_copy_capture_impl::frame_success_after_sync(
-                        frame,
-                        transform,
-                        damage,
-                        target_presentation_time,
-                        sync,
-                        &self.event_loop,
-                    );
+            let mut sessions = mem::take(&mut self.image_copy_sessions);
+            for s in &mut sessions {
+                // Cheapest check first.
+                if s.pending_frame.is_none() {
+                    continue;
                 }
-                Err(err) => {
-                    warn!("error rendering for image copy capture: {err:?}");
-                    frame.fail(CaptureFailureReason::Unknown);
-                    // Report full damage next time.
+
+                let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source())
+                else {
+                    continue;
+                };
+                if s_output != *output {
+                    continue;
+                }
+
+                // Recreate the damage tracker if the output changed.
+                let OutputModeSource::Static {
+                    size: last_size,
+                    scale: last_scale,
+                    transform: last_transform,
+                } = s.damage_tracker.mode().clone()
+                else {
+                    unreachable!("damage tracker must have static mode");
+                };
+                if size != last_size || scale != last_scale || transform != last_transform {
                     s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
                 }
-            }
-        }
 
-        // This shouldn't be possible since sessions are only added from the
-        // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
-        // (i.e., not in here), but append just in case it ever changes...
-        if !self.image_copy_sessions.is_empty() {
-            error!("session added while rendering image-copy-capture frame");
-            sessions.append(&mut self.image_copy_sessions);
-        }
-        self.image_copy_sessions = sessions;
+                let draw_cursor = s.session.draw_cursor();
+                let cached = &mut cached_elements[usize::from(draw_cursor)];
+                let elements = cached.get_or_insert_with(|| {
+                    let ctx = RenderCtx {
+                        renderer: &mut *renderer,
+                        target: RenderTarget::ScreenCapture,
+                        xray: None,
+                    };
+                    let mut elements = Vec::new();
+                    self.render(ctx, output, draw_cursor, &mut |elem| {
+                        elements.push(elem);
+                    });
+                    elements
+                });
+
+                let (damage, states) = s.damage_tracker.damage_output(1, elements).unwrap();
+                let Some(damage) = damage else {
+                    // No damage, capture the frame later.
+                    continue;
+                };
+
+                // Convert from Physical coordinates back to Buffer coordinates.
+                let physical_size = transform.transform_size(size);
+                let damage: Vec<Rectangle<i32, BufferCoords>> = damage
+                    .iter()
+                    .map(|dmg| {
+                        dmg.to_logical(1).to_buffer(
+                            1,
+                            transform.invert(),
+                            &physical_size.to_logical(1),
+                        )
+                    })
+                    .collect();
+
+                let frame = s.pending_frame.take().unwrap();
+                let buffer = frame.buffer();
+                let buffer_size = Size::<i32, BufferCoords>::from((size.w, size.h));
+                let capture_buffer = image_copy_capture_impl::capture_buffer(
+                    &buffer,
+                    buffer_size,
+                    wl_shm::Format::Xrgb8888,
+                );
+                let Some(capture_buffer) = capture_buffer else {
+                    frame.fail(CaptureFailureReason::BufferConstraints);
+                    // Report full damage next time.
+                    s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
+                    continue;
+                };
+
+                let res = match capture_buffer {
+                    CaptureBuffer::Dma(dmabuf) => {
+                        render_to_dmabuf(renderer, &mut s.damage_tracker, dmabuf, elements, states)
+                            .map(Some)
+                    }
+                    CaptureBuffer::Shm => render_to_shm(
+                        renderer,
+                        &mut s.damage_tracker,
+                        &buffer,
+                        wl_shm::Format::Xrgb8888,
+                        elements,
+                        states,
+                    )
+                    .map(|()| None),
+                };
+
+                match res {
+                    Ok(sync) => {
+                        image_copy_capture_impl::frame_success_after_sync(
+                            frame,
+                            transform,
+                            damage,
+                            target_presentation_time,
+                            sync,
+                            &self.event_loop,
+                        );
+                    }
+                    Err(err) => {
+                        warn!("error rendering for image copy capture: {err:?}");
+                        frame.fail(CaptureFailureReason::Unknown);
+                        // Report full damage next time.
+                        s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
+                    }
+                }
+            }
+
+            // This shouldn't be possible since sessions are only added from the
+            // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
+            // (i.e., not in here), but append just in case it ever changes...
+            if !self.image_copy_sessions.is_empty() {
+                error!("session added while rendering image-copy-capture frame");
+                sessions.append(&mut self.image_copy_sessions);
+            }
+            self.image_copy_sessions = sessions;
+        });
     }
 
     pub fn render_for_image_copy_cursor_capture<R: NiriCaptureRenderer>(
@@ -6664,101 +6675,109 @@ impl Niri {
         PointerRenderElements<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_image_copy_cursor_capture");
+        if !self.image_copy_cursor_sessions.iter().any(|s| {
+            s.pending_frame.is_some()
+                && image_copy_capture_impl::source_output(&s.session.source()).as_ref()
+                    == Some(output)
+        }) {
+            return;
+        }
 
         let scale: Scale<f64> = output.current_scale().fractional_scale().into();
         let reference_luminance = self.output_capture_reference_luminance(output);
+        with_sdr_capture(renderer, reference_luminance, |renderer| {
+            // The cursor render is the same for all sessions on the output.
+            let mut cached_elements = None;
 
-        // The cursor render is the same for all sessions on the output.
-        let mut cached_elements = None;
-
-        let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
-        for s in &mut sessions {
-            if s.pending_frame.is_none() {
-                continue;
-            }
-            let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source()) else {
-                continue;
-            };
-            if s_output != *output {
-                continue;
-            }
-
-            // The constraints are kept up to date with the cursor image size in
-            // refresh_image_copy_cursor_sessions, which also fails pending frames on change.
-            let Some(constraints) = s.session.current_constraints() else {
-                let frame = s.pending_frame.take().unwrap();
-                frame.fail(CaptureFailureReason::BufferConstraints);
-                continue;
-            };
-            let size = Size::<i32, Physical>::from((constraints.size.w, constraints.size.h));
-
-            // Recreate the damage tracker if the cursor buffer size or output scale changed.
-            let OutputModeSource::Static {
-                size: last_size,
-                scale: last_scale,
-                ..
-            } = s.damage_tracker.mode().clone()
-            else {
-                unreachable!("damage tracker must have static mode");
-            };
-            if size != last_size || scale != last_scale {
-                s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
-            }
-
-            let elements = cached_elements
-                .get_or_insert_with(|| self.render_cursor_for_capture(renderer, output));
-
-            let (damage, states) = s.damage_tracker.damage_output(1, elements).unwrap();
-            if damage.is_none() {
-                // No change, capture the frame later.
-                continue;
-            }
-
-            let frame = s.pending_frame.take().unwrap();
-            let buffer = frame.buffer();
-            let capture_buffer = image_copy_capture_impl::capture_buffer(
-                &buffer,
-                constraints.size,
-                wl_shm::Format::Argb8888,
-            );
-            if !matches!(capture_buffer, Some(CaptureBuffer::Shm)) {
-                frame.fail(CaptureFailureReason::BufferConstraints);
-                // Report full damage next time.
-                s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
-                continue;
-            }
-
-            let res = render_to_shm(
-                renderer,
-                &mut s.damage_tracker,
-                &buffer,
-                wl_shm::Format::Argb8888,
-                elements,
-                states,
-                reference_luminance,
-            );
-            match res {
-                Ok(()) => {
-                    let full_damage = vec![Rectangle::from_size(constraints.size)];
-                    frame.success(Transform::Normal, full_damage, target_presentation_time);
+            let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
+            for s in &mut sessions {
+                if s.pending_frame.is_none() {
+                    continue;
                 }
-                Err(err) => {
-                    warn!("error rendering for cursor capture: {err:?}");
-                    frame.fail(CaptureFailureReason::Unknown);
-                    // Report full damage next time.
+                let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source())
+                else {
+                    continue;
+                };
+                if s_output != *output {
+                    continue;
+                }
+
+                // The constraints are kept up to date with the cursor image size in
+                // refresh_image_copy_cursor_sessions, which also fails pending frames on change.
+                let Some(constraints) = s.session.current_constraints() else {
+                    let frame = s.pending_frame.take().unwrap();
+                    frame.fail(CaptureFailureReason::BufferConstraints);
+                    continue;
+                };
+                let size = Size::<i32, Physical>::from((constraints.size.w, constraints.size.h));
+
+                // Recreate the damage tracker if the cursor buffer size or output scale changed.
+                let OutputModeSource::Static {
+                    size: last_size,
+                    scale: last_scale,
+                    ..
+                } = s.damage_tracker.mode().clone()
+                else {
+                    unreachable!("damage tracker must have static mode");
+                };
+                if size != last_size || scale != last_scale {
                     s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
                 }
-            }
-        }
 
-        // This shouldn't be possible since sessions are only added from the
-        // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
-        // (i.e., not in here), but append just in case it ever changes...
-        if !self.image_copy_cursor_sessions.is_empty() {
-            error!("session added while rendering image-copy-capture frame");
-            sessions.append(&mut self.image_copy_cursor_sessions);
-        }
-        self.image_copy_cursor_sessions = sessions;
+                let elements = cached_elements
+                    .get_or_insert_with(|| self.render_cursor_for_capture(renderer, output));
+
+                let (damage, states) = s.damage_tracker.damage_output(1, elements).unwrap();
+                if damage.is_none() {
+                    // No change, capture the frame later.
+                    continue;
+                }
+
+                let frame = s.pending_frame.take().unwrap();
+                let buffer = frame.buffer();
+                let capture_buffer = image_copy_capture_impl::capture_buffer(
+                    &buffer,
+                    constraints.size,
+                    wl_shm::Format::Argb8888,
+                );
+                if !matches!(capture_buffer, Some(CaptureBuffer::Shm)) {
+                    frame.fail(CaptureFailureReason::BufferConstraints);
+                    // Report full damage next time.
+                    s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+                    continue;
+                }
+
+                let res = render_to_shm(
+                    renderer,
+                    &mut s.damage_tracker,
+                    &buffer,
+                    wl_shm::Format::Argb8888,
+                    elements,
+                    states,
+                );
+                match res {
+                    Ok(()) => {
+                        let full_damage = vec![Rectangle::from_size(constraints.size)];
+                        frame.success(Transform::Normal, full_damage, target_presentation_time);
+                    }
+                    Err(err) => {
+                        warn!("error rendering for cursor capture: {err:?}");
+                        frame.fail(CaptureFailureReason::Unknown);
+                        // Report full damage next time.
+                        s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+                    }
+                }
+            }
+
+            // This shouldn't be possible since sessions are only added from the
+            // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
+            // (i.e., not in here), but append just in case it ever changes...
+            if !self.image_copy_cursor_sessions.is_empty() {
+                error!("session added while rendering image-copy-capture frame");
+                sessions.append(&mut self.image_copy_cursor_sessions);
+            }
+            self.image_copy_cursor_sessions = sessions;
+        });
     }
 
     pub fn render_cursor_for_capture<R: NiriRenderer>(
@@ -6943,19 +6962,12 @@ impl Niri {
         elements: &[impl RenderElement<R>],
         states: RenderElementStates,
         screencopy: &Screencopy,
-        reference_luminance: f64,
     ) -> anyhow::Result<Option<SyncPoint>> {
         let sync = match screencopy.buffer() {
             ScreencopyBuffer::Dmabuf(dmabuf) => {
-                let sync = render_to_dmabuf(
-                    renderer,
-                    damage_tracker,
-                    dmabuf.clone(),
-                    elements,
-                    states,
-                    reference_luminance,
-                )
-                .context("error rendering to screencopy dmabuf")?;
+                let sync =
+                    render_to_dmabuf(renderer, damage_tracker, dmabuf.clone(), elements, states)
+                        .context("error rendering to screencopy dmabuf")?;
                 Some(sync)
             }
             ScreencopyBuffer::Shm(wl_buffer) => {
@@ -6966,7 +6978,6 @@ impl Niri {
                     wl_shm::Format::Xrgb8888,
                     elements,
                     states,
-                    reference_luminance,
                 )
                 .context("error rendering to screencopy shm buffer")?;
                 None
@@ -7009,79 +7020,83 @@ impl Niri {
         OutputRenderElements<R>: RenderElement<R>,
     {
         self.global_space.outputs().cloned().filter_map(|output| {
-            let size = output.current_mode().unwrap().size;
-            let transform = output.current_transform();
-            let size = transform.transform_size(size);
+            let reference_luminance = self.output_capture_reference_luminance(&output);
+            with_sdr_capture(renderer, reference_luminance, |renderer| {
+                let size = output.current_mode().unwrap().size;
+                let transform = output.current_transform();
+                let size = transform.transform_size(size);
 
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            let targets = [
-                RenderTarget::Output,
-                RenderTarget::Screencast,
-                RenderTarget::ScreenCapture,
-            ];
-            let screenshot = targets.map(|target| {
-                let ctx = RenderCtx {
-                    renderer,
-                    target,
-                    xray: None,
-                };
-                let elements = self.render_to_vec(ctx, &output, false);
-                let elements = elements.iter().rev();
-
-                let res = render_to_texture(
-                    renderer,
-                    size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements,
-                );
-                if let Err(err) = &res {
-                    warn!("error rendering output {}: {err:?}", output.name());
-                }
-                let res_output = res.ok();
-
-                let mut pointer = Vec::new();
-
-                // We check the pointer visibility for Disabled (and not .is_visible()) in order to
-                // show the pointer even when it's hidden through cursor {} options. The user can
-                // then toggle it in the screenshot UI as needed.
-                if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
-                }
-
-                let res_pointer = if pointer.is_empty() {
-                    None
-                } else {
-                    let res = render_to_encompassing_texture(
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let targets = [
+                    RenderTarget::Output,
+                    RenderTarget::Screencast,
+                    RenderTarget::ScreenCapture,
+                ];
+                let screenshot = targets.map(|target| {
+                    let ctx = RenderCtx {
                         renderer,
+                        target,
+                        xray: None,
+                    };
+                    let elements = self.render_to_vec(ctx, &output, false);
+                    let elements = elements.iter().rev();
+
+                    let res = render_to_texture(
+                        renderer,
+                        size,
                         scale,
                         Transform::Normal,
                         Fourcc::Abgr8888,
-                        &pointer,
+                        elements,
                     );
                     if let Err(err) = &res {
-                        warn!("error rendering pointer for {}: {err:?}", output.name());
+                        warn!("error rendering output {}: {err:?}", output.name());
                     }
-                    res.ok()
-                };
+                    let res_output = res.ok();
 
-                res_output.map(|(texture, _)| {
-                    OutputScreenshot::from_textures(
-                        renderer,
-                        scale,
-                        texture,
-                        res_pointer.map(|(texture, _, geo)| (texture, geo)),
-                    )
-                })
-            });
+                    let mut pointer = Vec::new();
 
-            if screenshot.iter().any(|res| res.is_none()) {
-                return None;
-            }
+                    // We check the pointer visibility for Disabled (and not .is_visible()) in order
+                    // to show the pointer even when it's hidden through cursor
+                    // {} options. The user can then toggle it in the screenshot
+                    // UI as needed.
+                    if self.pointer_visibility != PointerVisibility::Disabled {
+                        self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
+                    }
 
-            let screenshot = screenshot.map(|res| res.unwrap());
-            Some((output, screenshot))
+                    let res_pointer = if pointer.is_empty() {
+                        None
+                    } else {
+                        let res = render_to_encompassing_texture(
+                            renderer,
+                            scale,
+                            Transform::Normal,
+                            Fourcc::Abgr8888,
+                            &pointer,
+                        );
+                        if let Err(err) = &res {
+                            warn!("error rendering pointer for {}: {err:?}", output.name());
+                        }
+                        res.ok()
+                    };
+
+                    res_output.map(|(texture, _)| {
+                        OutputScreenshot::from_textures(
+                            renderer,
+                            scale,
+                            texture,
+                            res_pointer.map(|(texture, _, geo)| (texture, geo)),
+                        )
+                    })
+                });
+
+                if screenshot.iter().any(|res| res.is_none()) {
+                    return None;
+                }
+
+                let screenshot = screenshot.map(|res| res.unwrap());
+                Some((output, screenshot))
+            })
         })
     }
 
@@ -7111,21 +7126,26 @@ impl Niri {
         let size = transform.transform_size(size);
 
         let scale = Scale::from(output.current_scale().fractional_scale());
-        set_sdr_capture_blend(renderer, self.output_capture_reference_luminance(output));
-        let ctx = RenderCtx {
+        let pixels = with_sdr_capture(
             renderer,
-            target: RenderTarget::ScreenCapture,
-            xray: None,
-        };
-        let elements = self.render_to_vec(ctx, output, include_pointer);
-        let elements = elements.iter().rev();
-        let pixels = render_to_vec(
-            renderer,
-            size,
-            scale,
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            elements,
+            self.output_capture_reference_luminance(output),
+            |renderer| {
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                };
+                let elements = self.render_to_vec(ctx, output, include_pointer);
+                let elements = elements.iter().rev();
+                render_to_vec(
+                    renderer,
+                    size,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements,
+                )
+            },
         )?;
 
         self.save_screenshot(size, pixels, write_to_disk, path)
@@ -7155,53 +7175,64 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
-        let mut elements: Vec<WindowScreenshotRenderElement<R>> = Vec::new();
+        let (size, pixels) = with_sdr_capture(
+            renderer,
+            self.output_capture_reference_luminance(output),
+            |renderer| {
+                let mut elements: Vec<WindowScreenshotRenderElement<R>> = Vec::new();
 
-        // Add pointer if requested and it's over this window.
-        if show_pointer {
-            if let Some((_, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
-                // Pointer elements are at output-local physical coords.
-                // Relocate by -win_pos to make them window-relative.
-                let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
-                self.render_pointer(renderer, output, &mut |elem| {
-                    let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                    elements.push(elem.into());
+                // Add pointer if requested and it's over this window.
+                if show_pointer {
+                    if let Some((_, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
+                        // Pointer elements are at output-local physical coords.
+                        // Relocate by -win_pos to make them window-relative.
+                        let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
+                        self.render_pointer(renderer, output, &mut |elem| {
+                            let elem =
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                            elements.push(elem.into());
+                        });
+                    }
+                }
+                let pointer_count = elements.len();
+
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                };
+                mapped.render(
+                    ctx,
+                    mapped.window.geometry().loc.to_f64(),
+                    scale,
+                    alpha,
+                    XrayPos::default(),
+                    &mut |elem| elements.push(elem.into()),
+                );
+
+                // The pointer is not included in encompassing_geo because we don't want it to
+                // expand the screenshot size.
+                let geo = encompassing_geo(scale, elements.iter().skip(pointer_count));
+                let elements = elements.iter().rev().map(|elem| {
+                    RelocateRenderElement::from_element(
+                        elem,
+                        geo.loc.upscale(-1),
+                        Relocate::Relative,
+                    )
                 });
-            }
-        }
-        let pointer_count = elements.len();
-
-        set_sdr_capture_blend(renderer, self.output_capture_reference_luminance(output));
-        let ctx = RenderCtx {
-            renderer,
-            target: RenderTarget::ScreenCapture,
-            xray: None,
-        };
-        mapped.render(
-            ctx,
-            mapped.window.geometry().loc.to_f64(),
-            scale,
-            alpha,
-            XrayPos::default(),
-            &mut |elem| elements.push(elem.into()),
-        );
-
-        // The pointer is not included in encompassing_geo because we don't want it to expand the
-        // screenshot size.
-        let geo = encompassing_geo(scale, elements.iter().skip(pointer_count));
-        let elements = elements.iter().rev().map(|elem| {
-            RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
-        });
-        let pixels = render_to_vec(
-            renderer,
-            geo.size,
-            scale,
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            elements,
+                let pixels = render_to_vec(
+                    renderer,
+                    geo.size,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements,
+                )?;
+                Ok::<_, anyhow::Error>((geo.size, pixels))
+            },
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
+        self.save_screenshot(size, pixels, write_to_disk, path)
             .context("error saving screenshot")
     }
 
@@ -7358,23 +7389,28 @@ impl Niri {
             let size = transform.transform_size(size);
 
             let scale = output.current_scale().fractional_scale();
-            set_sdr_capture_blend(renderer, self.output_capture_reference_luminance(output));
-            let ctx = RenderCtx {
+            let pixels = with_sdr_capture(
                 renderer,
-                target: RenderTarget::ScreenCapture,
-                xray: None,
-            };
-            let elements = self.render_to_vec(ctx, output, include_pointer);
+                self.output_capture_reference_luminance(output),
+                |renderer| {
+                    let ctx = RenderCtx {
+                        renderer,
+                        target: RenderTarget::ScreenCapture,
+                        xray: None,
+                    };
+                    let elements = self.render_to_vec(ctx, output, include_pointer);
 
-            let pixels = render_to_vec(
-                renderer,
-                size,
-                Scale::from(scale),
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elements.iter().rev(),
-            )
-            .context("error rendering")?;
+                    render_to_vec(
+                        renderer,
+                        size,
+                        Scale::from(scale),
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )
+                    .context("error rendering")
+                },
+            )?;
 
             let dst = Rectangle::new(
                 loc.to_f64().to_physical_precise_round(screenshot_scale),

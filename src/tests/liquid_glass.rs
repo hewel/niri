@@ -13,7 +13,7 @@ use crate::render_helpers::background_effect::{
 use crate::render_helpers::blend::{self, FrameBlendState};
 use crate::render_helpers::shaders::Shaders;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::xray::{Xray, XrayPos};
+use crate::render_helpers::xray::{Xray, XrayFrame, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 const SIZE: i32 = 128;
@@ -31,19 +31,21 @@ fn neutral_glass() -> LiquidGlass {
     }
 }
 
-fn wallpaper(color: Color32F) -> Xray {
+fn wallpaper() -> Xray {
     let mut xray = Xray::new();
     let geo = Rectangle::<f64, Logical>::from_size((SIZE as f64, SIZE as f64).into());
     xray.workspaces.push((geo, Color32F::TRANSPARENT));
-    for buffer in [&xray.background[0], &xray.backdrop[0]] {
-        let mut buffer = buffer.borrow_mut();
-        buffer.update_size((SIZE, SIZE).into(), Scale::from(1.));
+    xray.update((SIZE, SIZE).into(), Scale::from(1.), Default::default());
+    xray
+}
+
+fn fill_wallpaper(frame: &XrayFrame<'_>, target: RenderTarget, color: Color32F) {
+    frame.populate::<GlesRenderer>(target, |_, elements| {
         let color = SolidColorBuffer::new((SIZE as f64, SIZE as f64), color);
-        buffer.elements::<GlesRenderer>().push(
+        elements.push(
             SolidColorRenderElement::from_buffer(&color, (0., 0.), 1., Kind::Unspecified).into(),
         );
-    }
-    xray
+    });
 }
 
 fn elements(
@@ -52,6 +54,16 @@ fn elements(
     config: ConfigEffect,
     geometry: Rectangle<f64, Logical>,
 ) -> Vec<BackgroundEffectElement> {
+    elements_for_target(renderer, xray, config, geometry, RenderTarget::Output)
+}
+
+fn elements_for_target(
+    renderer: &mut impl crate::render_helpers::renderer::NiriRenderer,
+    xray: &Xray,
+    config: ConfigEffect,
+    geometry: Rectangle<f64, Logical>,
+    target: RenderTarget,
+) -> Vec<BackgroundEffectElement> {
     let mut effect = BackgroundEffect::new();
     effect.update_render_elements(CornerRadius::from(12.), config, false);
     let mut elements = Vec::new();
@@ -59,7 +71,7 @@ fn elements(
         RenderCtx {
             renderer,
             xray: Some(xray),
-            target: RenderTarget::Output,
+            target,
         },
         None,
         RenderParams {
@@ -108,7 +120,9 @@ fn glass_sdr_input_is_encoded_once_and_output_state_is_restored() {
     let color = Color32F::from([0.25, 0.5, 0.75, 1.]);
     for output in [None, HDR] {
         for glass_first in [false, true] {
-            let xray = wallpaper(color);
+            let xray = wallpaper();
+            let frame = xray.frame();
+            fill_wallpaper(&frame, RenderTarget::Output, color);
             blend::set_frame_blend(&mut renderer, output);
             // Either consumer can prepare the shared capture first; a cached Glass program
             // must not leak into an ordinary consumer created afterwards.
@@ -172,32 +186,35 @@ fn glass_sdr_input_is_encoded_once_and_output_state_is_restored() {
         }
     }
     // Restore a nondefault SDR capture reference, then draw HDR content through that state.
-    blend::set_sdr_capture_blend(&mut renderer, 100.);
-    let xray = wallpaper(color);
-    let glass = elements(
-        &mut renderer,
-        &xray,
-        ConfigEffect {
-            liquid_glass: Some(neutral_glass()),
-            ..Default::default()
-        },
-        geometry(),
-    );
-    assert!(!glass.is_empty());
-    let mut texture: smithay::backend::renderer::gles::GlesTexture =
-        smithay::backend::renderer::Offscreen::create_buffer(
-            &mut renderer,
-            Fourcc::Abgr8888,
-            Size::from((16, 16)),
-        )
-        .unwrap();
-    use smithay::backend::renderer::{Bind, Frame, Renderer};
-    let mut target = renderer.bind(&mut texture).unwrap();
-    let frame = renderer
-        .render(&mut target, (16, 16).into(), Transform::Normal)
-        .unwrap();
-    assert!((FrameBlendState::ref_lum_scale(&frame) - 0.01).abs() < 1e-6);
-    frame.finish().unwrap().wait().unwrap();
+    blend::with_sdr_capture(&mut renderer, 100., |renderer| {
+        let xray = wallpaper();
+        let scope = xray.frame();
+        fill_wallpaper(&scope, RenderTarget::Output, color);
+        let glass = elements(
+            renderer,
+            &xray,
+            ConfigEffect {
+                liquid_glass: Some(neutral_glass()),
+                ..Default::default()
+            },
+            geometry(),
+        );
+        assert!(!glass.is_empty());
+        let mut texture: smithay::backend::renderer::gles::GlesTexture =
+            smithay::backend::renderer::Offscreen::create_buffer(
+                renderer,
+                Fourcc::Abgr8888,
+                Size::from((16, 16)),
+            )
+            .unwrap();
+        use smithay::backend::renderer::{Bind, Frame, Renderer};
+        let mut target = renderer.bind(&mut texture).unwrap();
+        let frame = renderer
+            .render(&mut target, (16, 16).into(), Transform::Normal)
+            .unwrap();
+        assert!((FrameBlendState::ref_lum_scale(&frame) - 0.01).abs() < 1e-6);
+        frame.finish().unwrap().wait().unwrap();
+    });
 }
 
 #[test]
@@ -209,7 +226,9 @@ fn glass_modes_draw_and_keep_transparent_edges_premultiplied() {
     for output in [None, HDR] {
         for physical_refraction in [0., 1.] {
             for refraction_dilute in [0., 1.] {
-                let xray = wallpaper(Color32F::from([0.1, 0.2, 0.3, 0.5]));
+                let xray = wallpaper();
+                let frame = xray.frame();
+                fill_wallpaper(&frame, RenderTarget::Output, Color32F::from([0.1, 0.2, 0.3, 0.5]));
                 blend::set_frame_blend(&mut renderer, output);
                 let glass = elements(
                     &mut renderer,
@@ -246,7 +265,13 @@ fn glass_off_and_nonxray_keep_the_original_programs() {
     let Some(mut renderer) = gpu::gles_renderer() else {
         return;
     };
-    let xray = wallpaper(Color32F::from([0.25, 0.5, 0.75, 1.]));
+    let xray = wallpaper();
+    let frame = xray.frame();
+    fill_wallpaper(
+        &frame,
+        RenderTarget::Output,
+        Color32F::from([0.25, 0.5, 0.75, 1.]),
+    );
     let ordinary = elements(
         &mut renderer,
         &xray,
@@ -351,21 +376,43 @@ fn glass_refraction_follows_window_geometry_when_moved() {
         ..Default::default()
     };
     let draw = |renderer: &mut GlesRenderer, shift: (f64, f64), glass: bool| {
-        let xray = wallpaper(Color32F::from([0.2, 0.3, 0.4, 1.]));
-        {
-            let mut buffer = xray.background[0].borrow_mut();
-            let elements = buffer.elements::<GlesRenderer>();
+        let xray = wallpaper();
+        let frame = xray.frame();
+        frame.populate::<GlesRenderer>(RenderTarget::Output, |_, elements| {
+            let base = SolidColorBuffer::new((SIZE as f64, SIZE as f64), [0.2, 0.3, 0.4, 1.]);
+            elements.push(
+                SolidColorRenderElement::from_buffer(&base, (0., 0.), 1., Kind::Unspecified).into(),
+            );
             for y in 0..4 {
                 for x in 0..4 {
-                    let color = if (x + y) % 2 == 0 { [0.1, 0.6, 0.2, 1.] } else { [0.8, 0.2, 0.5, 1.] };
+                    let color = if (x + y) % 2 == 0 {
+                        [0.1, 0.6, 0.2, 1.]
+                    } else {
+                        [0.8, 0.2, 0.5, 1.]
+                    };
                     let tile = SolidColorBuffer::new((24., 24.), color);
-                    elements.insert(0, SolidColorRenderElement::from_buffer(&tile,
-                        (shift.0 + x as f64 * 24., shift.1 + y as f64 * 24.), 1., Kind::Unspecified).into());
+                    elements.insert(
+                        0,
+                        SolidColorRenderElement::from_buffer(
+                            &tile,
+                            (shift.0 + x as f64 * 24., shift.1 + y as f64 * 24.),
+                            1.,
+                            Kind::Unspecified,
+                        )
+                        .into(),
+                    );
                 }
             }
-        }
+        });
         let geo = Rectangle::new((shift.0 + 16., shift.1 + 16.).into(), (64., 64.).into());
-        let config = if glass { config } else { ConfigEffect { xray: Some(true), ..Default::default() } };
+        let config = if glass {
+            config
+        } else {
+            ConfigEffect {
+                xray: Some(true),
+                ..Default::default()
+            }
+        };
         let elements = elements(renderer, &xray, config, geo);
         pixels(renderer, &elements)
     };
@@ -382,4 +429,107 @@ fn glass_refraction_follows_window_geometry_when_moved() {
         }
     }
     assert!(differs, "Glass was drawn but made no observable change to the patterned wallpaper");
+}
+
+#[test]
+fn xray_snapshot_background_is_capture_safe_and_restored_after_error() {
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+    let xray = wallpaper();
+    let frame = xray.frame();
+    let targets = [
+        RenderTarget::Output,
+        RenderTarget::Screencast,
+        RenderTarget::ScreenCapture,
+    ];
+    let colors = [
+        Color32F::from([1., 0., 0., 1.]),
+        Color32F::from([0., 1., 0., 1.]),
+        Color32F::from([0., 0., 1., 1.]),
+    ];
+    for (target, color) in targets.into_iter().zip(colors) {
+        fill_wallpaper(&frame, target, color);
+    }
+    let mut draw = |xray: &Xray, target| {
+        let elements = elements_for_target(
+            &mut renderer,
+            xray,
+            ConfigEffect {
+                xray: Some(true),
+                ..Default::default()
+            },
+            geometry(),
+            target,
+        );
+        pixel(&pixels(&mut renderer, &elements), 64, 64).to_vec()
+    };
+    let expected = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    for (target, expected) in targets.into_iter().zip(expected) {
+        assert_eq!(draw(&xray, target), expected);
+    }
+    let result: Result<(), ()> = xray.with_snapshot_background(true, |xray| {
+        // The window can remain unblocked, but its background is always capture-safe.
+        for target in targets {
+            assert_eq!(draw(xray, target), expected[1]);
+        }
+        Err(())
+    });
+    assert!(result.is_err());
+    for (target, expected) in targets.into_iter().zip(expected) {
+        assert_eq!(draw(&xray, target), expected);
+    }
+    xray.with_snapshot_background(false, |xray| {
+        // No sensitive layers: reuse the already prepared output, not another capture.
+        for target in targets {
+            assert_eq!(draw(xray, target), expected[0]);
+        }
+    });
+    for (target, expected) in targets.into_iter().zip(expected) {
+        assert_eq!(draw(&xray, target), expected);
+    }
+}
+
+#[test]
+fn xray_frame_does_not_retain_previous_scene_elements() {
+    let Some(mut renderer) = gpu::gles_renderer() else {
+        return;
+    };
+    let xray = wallpaper();
+    let config = ConfigEffect {
+        xray: Some(true),
+        ..Default::default()
+    };
+    {
+        let frame = xray.frame();
+        fill_wallpaper(
+            &frame,
+            RenderTarget::Output,
+            Color32F::from([1., 0., 0., 1.]),
+        );
+        let elements = elements(&mut renderer, &xray, config, geometry());
+        assert_eq!(
+            pixel(&pixels(&mut renderer, &elements), 64, 64),
+            [255, 0, 0, 255]
+        );
+    }
+    {
+        let _frame = xray.frame();
+        let elements = elements(&mut renderer, &xray, config, geometry());
+        assert_eq!(
+            pixel(&pixels(&mut renderer, &elements), 64, 64),
+            [0, 0, 0, 0]
+        );
+    }
+    let frame = xray.frame();
+    fill_wallpaper(
+        &frame,
+        RenderTarget::Output,
+        Color32F::from([0., 0., 1., 1.]),
+    );
+    let elements = elements(&mut renderer, &xray, config, geometry());
+    assert_eq!(
+        pixel(&pixels(&mut renderer, &elements), 64, 64),
+        [0, 0, 255, 255]
+    );
 }

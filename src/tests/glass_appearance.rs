@@ -155,18 +155,18 @@ fn compare_glass_appearance() {
             );
         }
     }
-    {
-        let mut buffer = xray.background[0].borrow_mut();
-        buffer.update_size(size.into(), Scale::from(1.));
-        buffer.update_blur_options(crate::render_helpers::blur::BlurOptions::from(aligned.blur));
-        for element in &wallpaper {
-            buffer
-                .elements::<GlesRenderer>()
-                .push(element.clone().into());
+    xray.update(
+        size.into(),
+        Scale::from(1.),
+        crate::render_helpers::blur::BlurOptions::from(aligned.blur),
+    );
+    let frame = xray.frame();
+    frame.populate::<GlesRenderer>(RenderTarget::Output, |for_backdrop, elements| {
+        if !for_backdrop {
+            elements.extend(wallpaper.iter().cloned().map(Into::into));
         }
-    }
-    // Zero-sized backdrop avoids a second background draw; one shared opaque SDR
-    // wallpaper capture (and cached blur result) is used by every case.
+    });
+    // One shared opaque SDR wallpaper capture (and cached blur result) is used by every case.
     let mut ordinary = effect(&aligned);
     ordinary.liquid_glass = None;
     let mut sharp = effect(&aligned);
