@@ -17,6 +17,7 @@ mod glass_appearance;
 mod layer_shell;
 mod liquid_glass;
 mod remove_output;
+mod session_lock;
 mod shader_runtime;
 mod smooth_corners;
 mod suspended;

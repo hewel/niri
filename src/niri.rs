@@ -16,10 +16,11 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use calloop::ping::make_ping;
 use niri_config::debug::PreviewRender;
+use niri_config::input::XkbFile;
 use niri_config::output::{HdrMode, MaxBpc, TearingMode};
 use niri_config::window_rule::VrrRule;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
+    Bind, Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
@@ -35,7 +36,6 @@ use smithay::backend::renderer::element::{
     default_primary_scanout_output_compare, Element, Id, Kind, PrimaryScanoutOutput, RenderElement,
     RenderElementStates,
 };
-use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
@@ -49,7 +49,7 @@ use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerMap, LayerSurface, PopupGrab, PopupManager,
     PopupUngrabStrategy, Space, Window, WindowSurfaceType,
 };
-use smithay::input::keyboard::{Layout as KeyboardLayout, LedState, XkbConfig};
+use smithay::input::keyboard::{KeymapFile, Layout as KeyboardLayout, LedState, XkbConfig};
 use smithay::input::pointer::{
     CursorIcon, CursorImageStatus, CursorImageSurfaceData, Focus,
     GrabStartData as PointerGrabStartData, MotionEvent,
@@ -146,12 +146,15 @@ use crate::dbus::freedesktop_locale1::Locale1ToNiri;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_login1::Login1ToNiri;
 #[cfg(feature = "dbus")]
+use crate::dbus::gnome_shell::{GlobalShortcutsPortalBinds, ShellToNiri};
+#[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospect};
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
 use crate::handlers::image_copy_capture::{
-    self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
+    self as image_copy_capture_impl, CursorCaptureGeometry, ImageCopyCursorSession,
+    ImageCopySession,
 };
 use crate::handlers::virtual_keyboard::VirtualKeyboardKeymap;
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
@@ -179,7 +182,7 @@ use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
-use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::screencopy::{Screencopy, ScreencopyManagerState};
 use crate::render_helpers::blend::{
     scanout_color_transform, with_sdr_capture, BlendSurfaceRenderElement, ContentColor,
     DEFAULT_REFERENCE_LUMINANCE,
@@ -194,8 +197,8 @@ use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
-    encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
+    encompassing_geo, render_to_encompassing_texture, render_to_shm, render_to_texture,
+    render_to_vec, shaders, CaptureBuffer, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -213,11 +216,11 @@ use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
-    logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
+    center, center_f64, get_monotonic_time, ipc_transform_to_smithay, is_mapped, logical_output,
+    make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform, winit_scale, write_png_rgba8, xwayland,
 };
-use crate::window::mapped::MappedId;
+use crate::window::mapped::{MappedId, WindowCastRenderElements};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
@@ -390,6 +393,12 @@ pub struct Niri {
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
+    /// Binds whose release action is pending, keyed by the key code.
+    pub pending_release_binds: HashMap<Keycode, Bind>,
+    /// Same as `pending_release_binds`, but for mouse buttons, keyed by the button code.
+    pub pending_mouse_release_binds: HashMap<u32, Bind>,
+    /// Same as `pending_release_binds`, but for tablet tool buttons, keyed by the button code.
+    pub pending_tablet_release_binds: HashMap<u32, Bind>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     // Timer waking up the event loop at the vblank where the earliest pending commit-timer
@@ -417,12 +426,14 @@ pub struct Niri {
     /// active, and cleared whenever the configured keymap changes. Used to
     /// compare against virtual keyboard keymaps, and to switch back to it
     /// afterwards without going through the config again.
-    pub configured_keymap: Option<Arc<str>>,
+    pub configured_keymap: Option<KeymapFile>,
 
     pub cursor_manager: CursorManager,
     pub cursor_texture_cache: CursorTextureCache,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
+    /// Outputs that the pointer (along with its DnD icon) overlaps.
+    pub outputs_overlapping_pointer: Vec<Output>,
     /// Contents under pointer.
     ///
     /// Periodically updated: on motion and other events and in the loop callback. If you require
@@ -475,6 +486,8 @@ pub struct Niri {
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
+    #[cfg(feature = "dbus")]
+    pub global_shortcuts_portal_binds: GlobalShortcutsPortalBinds,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -498,6 +511,8 @@ pub struct Niri {
     pub a11y: A11y,
     #[cfg(feature = "dbus")]
     pub inhibit_power_key_fd: Option<zbus::zvariant::OwnedFd>,
+    #[cfg(feature = "dbus")]
+    pub gnome_shell: Option<crate::dbus::gnome_shell::Shell>,
 
     pub ipc_server: Option<IpcServer>,
     pub ipc_outputs_changed: bool,
@@ -1021,7 +1036,6 @@ impl State {
         self.niri.refresh_mapped_cast_outputs();
         // Should happen before refresh_window_rules(), but after anything that can start or stop
         // screencasts.
-        #[cfg(feature = "xdp-gnome-screencast")]
         self.niri.refresh_mapped_cast_window_rules();
         self.ipc_refresh_casts();
 
@@ -1056,32 +1070,60 @@ impl State {
 
         let mut sessions = mem::take(&mut self.niri.image_copy_sessions);
         sessions.retain_mut(|s| {
-            let Some(output) = live_output(&self.niri, &s.session.source()) else {
-                return false;
-            };
+            use image_copy_capture_impl::{output_capture_constraints, window_capture_constraints};
+
+            let source = s.session.source();
 
             // This runs once per event loop iteration, and building the full
             // constraints is expensive. We only compare the size, so a change
             // in the dmabuf formats or device alone doesn't matter to us here
             // (and if it does, polling is not the way to check for it).
-            let Some(mode) = output.current_mode() else {
+            let constraints = if let Some(id) = image_copy_capture_impl::source_mapped_id(&source) {
+                let Some((mapped, o)) = self.niri.find_mapped_output_by_id(id) else {
+                    // The window was closed.
+                    return false;
+                };
+                let Some(output) = o else {
+                    // All outputs are gone, but the window is there, so the stream will resume once
+                    // an output reappears.
+                    return true;
+                };
+                if !self.niri.output_state.contains_key(output) {
+                    return false;
+                }
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let size = mapped.capture_bbox(scale).size;
+                let size = Size::<i32, BufferCoords>::from((size.w, size.h));
+                if s.session
+                    .current_constraints()
+                    .is_some_and(|c| c.size == size)
+                {
+                    // The constraints match.
+                    return true;
+                }
+
+                let render_node = self.backend.primary_render_node();
+                image_copy_capture_impl::primary_render_formats(&mut self.backend).map(|formats| {
+                    window_capture_constraints(formats.as_ref(), render_node, mapped, output)
+                })
+            } else if let Some(output) = live_output(&self.niri, &source) {
+                let Some(mode) = output.current_mode() else {
+                    return false;
+                };
+                let size = Size::<i32, BufferCoords>::from((mode.size.w, mode.size.h));
+                if s.session.current_constraints().map(|c| c.size) == Some(size) {
+                    return true;
+                }
+
+                // The size changed, so build the full constraints and send them to the client
+                // below.
+                let render_node = self.backend.primary_render_node();
+                image_copy_capture_impl::primary_render_formats(&mut self.backend).and_then(
+                    |formats| output_capture_constraints(formats.as_ref(), render_node, &output),
+                )
+            } else {
                 return false;
             };
-            let size = Size::<i32, BufferCoords>::from((mode.size.w, mode.size.h));
-            if s.session.current_constraints().map(|c| c.size) == Some(size) {
-                return true;
-            }
-
-            // The size changed, so build the full constraints and send them to the client below.
-            let render_node = self.backend.primary_render_node();
-            let constraints = image_copy_capture_impl::primary_render_formats(&mut self.backend)
-                .and_then(|render_formats| {
-                    image_copy_capture_impl::output_capture_constraints(
-                        render_formats.as_ref(),
-                        render_node,
-                        &output,
-                    )
-                });
             let Some(constraints) = constraints else {
                 return false;
             };
@@ -1105,9 +1147,17 @@ impl State {
         }
         self.niri.image_copy_sessions = sessions;
 
-        // Cursor session constraints are refreshed in refresh_image_copy_cursor_sessions().
+        // Cursor session constraints are refreshed in render_cursor_for_capture().
         let mut cursor_sessions = mem::take(&mut self.niri.image_copy_cursor_sessions);
-        cursor_sessions.retain(|s| live_output(&self.niri, &s.session.source()).is_some());
+        cursor_sessions.retain(|s| {
+            let source = s.session.source();
+
+            if let Some(id) = image_copy_capture_impl::source_mapped_id(&source) {
+                self.niri.find_mapped_output_by_id(id).is_some()
+            } else {
+                live_output(&self.niri, &source).is_some()
+            }
+        });
         // This shouldn't be possible since sessions are only added from the
         // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
         // (i.e., not in here), but append just in case it ever changes...
@@ -1638,24 +1688,20 @@ impl State {
             let is_overview_open = self.niri.layout.is_overview_open();
 
             let mut surface = grab_on_layer(Layer::Overlay);
-            // FIXME: we shouldn't prioritize the top layer grabs over regular overlay input or a
-            // fullscreen layout window. This will need tracking in grab() to avoid handing it out
-            // in the first place. Or a better way to structure this code.
-            surface = surface.or_else(|| grab_on_layer(Layer::Top));
-
-            if !is_overview_open {
-                surface = surface.or_else(|| grab_on_layer(Layer::Bottom));
-                surface = surface.or_else(|| grab_on_layer(Layer::Background));
-            }
-
-            surface = surface.or_else(|| focus_on_layer(Layer::Overlay));
 
             if mon.render_above_top_layer() {
+                surface = surface.or_else(|| focus_on_layer(Layer::Overlay));
                 surface = surface.or_else(layout_focus);
-                surface = surface.or_else(|| focus_on_layer(Layer::Top));
-                surface = surface.or_else(|| focus_on_layer(Layer::Bottom));
                 surface = surface.or_else(|| focus_on_layer(Layer::Background));
             } else {
+                surface = surface.or_else(|| grab_on_layer(Layer::Top));
+
+                if !is_overview_open {
+                    surface = surface.or_else(|| grab_on_layer(Layer::Bottom));
+                    surface = surface.or_else(|| grab_on_layer(Layer::Background));
+                }
+
+                surface = surface.or_else(|| focus_on_layer(Layer::Overlay));
                 surface = surface.or_else(|| focus_on_layer(Layer::Top));
 
                 if is_overview_open {
@@ -1800,14 +1846,7 @@ impl State {
     }
 
     /// Loads the xkb keymap from a file config setting.
-    fn set_xkb_file(&mut self, xkb_file: String) -> anyhow::Result<()> {
-        let xkb_file = PathBuf::from(xkb_file);
-        let xkb_file = expand_home(&xkb_file)
-            .context("failed to expand ~")?
-            .unwrap_or(xkb_file);
-
-        let keymap = std::fs::read_to_string(xkb_file).context("failed to read xkb_file")?;
-
+    fn set_xkb_file_content(&mut self, keymap: String) -> anyhow::Result<()> {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         let restore = self.keyboard_state_to_restore();
 
@@ -1823,8 +1862,8 @@ impl State {
 
     fn load_xkb_file(&mut self) {
         let xkb_file = self.niri.config.borrow().input.keyboard.xkb.file.clone();
-        if let Some(xkb_file) = xkb_file {
-            if let Err(err) = self.set_xkb_file(xkb_file) {
+        if let Some(XkbFile(Some(keymap))) = xkb_file {
+            if let Err(err) = self.set_xkb_file_content(keymap) {
                 warn!("error loading xkb_file: {err:?}");
             }
         }
@@ -1931,8 +1970,8 @@ impl State {
         let mut xkb = self.niri.config.borrow().input.keyboard.xkb.clone();
         let mut set_xkb_config = true;
 
-        if let Some(xkb_file) = xkb.file.take() {
-            if let Err(err) = self.set_xkb_file(xkb_file) {
+        if let Some(XkbFile(Some(keymap))) = xkb.file.take() {
+            if let Err(err) = self.set_xkb_file_content(keymap) {
                 warn!("error loading xkb_file: {err:?}");
             } else {
                 set_xkb_config = false;
@@ -2019,6 +2058,11 @@ impl State {
             self.niri.cursor_texture_cache.clear();
         }
 
+        if config.debug.nested_show_host_cursor != old_config.debug.nested_show_host_cursor {
+            self.backend
+                .set_host_cursor_visible(config.debug.nested_show_host_cursor);
+        }
+
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
             reload_xkb = true;
@@ -2061,10 +2105,10 @@ impl State {
 
         let binds_changed = config.binds != old_config.binds;
         let new_mod_key = self.backend.mod_key(&config);
+        let mut hotkey_overlay_changed =
+            config.hotkey_overlay.hide_not_bound != old_config.hotkey_overlay.hide_not_bound;
         if new_mod_key != self.backend.mod_key(&old_config) || binds_changed {
-            self.niri
-                .hotkey_overlay
-                .on_hotkey_config_updated(new_mod_key);
+            hotkey_overlay_changed = true;
             self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
             self.niri.mods_with_horizontal_wheel_binds =
                 mods_with_horizontal_wheel_binds(new_mod_key, &config.binds);
@@ -2074,6 +2118,11 @@ impl State {
                 mods_with_tablet_stylus_binds(new_mod_key, &config.binds);
             self.niri.mods_with_finger_scroll_binds =
                 mods_with_finger_scroll_binds(new_mod_key, &config.binds);
+        }
+        if hotkey_overlay_changed {
+            self.niri
+                .hotkey_overlay
+                .on_hotkey_config_updated(new_mod_key);
         }
 
         if config.window_rules != old_config.window_rules {
@@ -2748,6 +2797,42 @@ impl State {
     }
 
     #[cfg(feature = "dbus")]
+    pub fn on_gnome_shell_msg(&mut self, msg: ShellToNiri) {
+        match msg {
+            ShellToNiri::GrabAccelerators {
+                accelerators,
+                results: tx,
+            } => {
+                trace!("GrabAccelerators: requesting grab accelerators: {accelerators:?}");
+                let results = self
+                    .niri
+                    .global_shortcuts_portal_binds
+                    .grab_accelerators(&accelerators);
+
+                trace!("GrabAccelerators: returning actions: {results:?}");
+                if let Err(err) = tx.send_blocking(results) {
+                    warn!("error sending grab accelerators result to gnome shell: {err:?}");
+                }
+            }
+            ShellToNiri::UngrabAccelerators {
+                actions,
+                result: tx,
+            } => {
+                trace!("UngrabAccelerators: requesting ungrab accelerators: {actions:?}",);
+                let result = self
+                    .niri
+                    .global_shortcuts_portal_binds
+                    .ungrab_accelerators(&actions);
+
+                trace!("UngrabAccelerators: returning result: {result:?}");
+                if let Err(err) = tx.send_blocking(result) {
+                    warn!("error sending ungrab accelerators result to gnome shell: {err:?}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "dbus")]
     pub fn on_introspect_msg(
         &mut self,
         to_introspect: &async_channel::Sender<NiriToIntrospect>,
@@ -2820,6 +2905,26 @@ impl State {
         let xkb = xkb.clone();
         self.set_xkb_config(xkb.to_xkb_config());
         self.ipc_keyboard_layouts_changed();
+    }
+}
+
+fn reset_damage_tracker_if_changed(
+    tracker: &mut OutputDamageTracker,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+) {
+    let OutputModeSource::Static {
+        size: last_size,
+        scale: last_scale,
+        transform: last_transform,
+    } = tracker.mode().clone()
+    else {
+        unreachable!("damage tracker must have static mode");
+    };
+
+    if size != last_size || scale != last_scale || transform != last_transform {
+        *tracker = OutputDamageTracker::new(size, scale, transform);
     }
 }
 
@@ -3344,6 +3449,9 @@ impl Niri {
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
 
         #[cfg(feature = "dbus")]
+        let global_shortcuts = GlobalShortcutsPortalBinds::new();
+
+        #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
 
         event_loop
@@ -3486,6 +3594,9 @@ impl Niri {
             popup_grab: None,
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
+            pending_release_binds: HashMap::new(),
+            pending_mouse_release_binds: HashMap::new(),
+            pending_tablet_release_binds: HashMap::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             commit_timing_wakeup_timer: None,
@@ -3514,6 +3625,7 @@ impl Niri {
             cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
             dnd_icon: None,
+            outputs_overlapping_pointer: Vec::new(),
             pointer_contents: PointContents::default(),
             pointer_visibility: PointerVisibility::Visible,
             pointer_inactivity_timer: None,
@@ -3545,6 +3657,8 @@ impl Niri {
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
+            #[cfg(feature = "dbus")]
+            global_shortcuts_portal_binds: global_shortcuts,
 
             window_mru_ui,
             minimized_strip_buffers: RefCell::new(HashMap::new()),
@@ -3564,6 +3678,8 @@ impl Niri {
             a11y,
             #[cfg(feature = "dbus")]
             inhibit_power_key_fd: None,
+            #[cfg(feature = "dbus")]
+            gnome_shell: None,
 
             ipc_server,
             ipc_outputs_changed: false,
@@ -3900,10 +4016,7 @@ impl Niri {
         match mem::take(&mut self.lock_state) {
             LockState::Locking(confirmation) => {
                 // We're locking and an output was removed, check if the requirements are now met.
-                let all_locked = self
-                    .output_state
-                    .values()
-                    .all(|state| state.lock_render_state == LockRenderState::Locked);
+                let all_locked = self.all_outputs_locked();
 
                 if all_locked {
                     let lock = confirmation.ext_session_lock().clone();
@@ -4122,6 +4235,15 @@ impl Niri {
             return false;
         }
 
+        let Some(mon) = self.layout.monitor_for_output(output) else {
+            return false;
+        };
+
+        // A fullscreen window above top layer covers bottom and background popups.
+        if mon.render_above_top_layer() {
+            return false;
+        }
+
         // Check if some layer-shell surface is on top.
         let layers = layer_map_for_output(output);
         let layer_popup_under = |layer| {
@@ -4139,7 +4261,6 @@ impl Niri {
                     layer_pos_within_output += mapped.bob_offset();
 
                     // Background and bottom layers move together with the workspaces.
-                    let mon = self.layout.monitor_for_output(output)?;
                     let (_, geo) = mon.workspace_under(pos_within_output)?;
                     layer_pos_within_output += geo.loc;
 
@@ -4372,11 +4493,6 @@ impl Niri {
             under = under
                 .or_else(interactive_moved_window_under)
                 .or_else(window_under)
-                .or_else(|| layer_popup_under(Layer::Top))
-                .or_else(|| layer_toplevel_under(Layer::Top))
-                .or_else(|| layer_popup_under(Layer::Bottom))
-                .or_else(|| layer_popup_under(Layer::Background))
-                .or_else(|| layer_toplevel_under(Layer::Bottom))
                 .or_else(|| layer_toplevel_under(Layer::Background));
         } else {
             if self.is_inside_hot_corner(output, pos_within_output) {
@@ -4568,6 +4684,11 @@ impl Niri {
             .windows()
             .find(|(_, m)| m.id() == id)
             .map(|(_, m)| m.window.clone())
+    }
+
+    pub fn find_mapped_output_by_id(&self, id: MappedId) -> Option<(&Mapped, Option<&Output>)> {
+        let (mon, mapped) = self.layout.windows().find(|(_, m)| m.id() == id)?;
+        Some((mapped, mon.map(|mon| mon.output())))
     }
 
     pub fn output_for_tablet(&self) -> Option<&Output> {
@@ -4823,6 +4944,8 @@ impl Niri {
     }
 
     pub fn refresh_pointer_outputs(&mut self) {
+        self.outputs_overlapping_pointer.clear();
+
         if !self.pointer_visibility.is_visible() {
             return;
         }
@@ -4844,16 +4967,8 @@ impl Niri {
                         .lock()
                         .unwrap()
                         .hotspot
-                });
-
-                let surface_pos = pointer_pos.to_i32_round() - hotspot;
-                let bbox = bbox_from_surface_tree(surface, surface_pos);
-
-                let dnd = self
-                    .dnd_icon
-                    .as_ref()
-                    .map(|icon| &icon.surface)
-                    .map(|surface| (surface, bbox_from_surface_tree(surface, surface_pos)));
+                })
+                .to_f64();
 
                 // FIXME we basically need to pick the largest scale factor across the overlapping
                 // outputs, this is how it's usually done in clients as well.
@@ -4862,34 +4977,60 @@ impl Niri {
                 let mut dnd_scale = 1.;
                 let mut dnd_transform = Transform::Normal;
                 for output in self.global_space.outputs() {
-                    let geo = self.global_space.output_geometry(output).unwrap();
+                    let output_scale = output.current_scale().fractional_scale();
+                    let geo = self.global_space.output_geometry(output).unwrap().to_f64();
+                    let mut overlaps = false;
 
                     // Compute pointer surface overlap.
+
+                    // Rounding matching render_pointer().
+                    let surface_pos = (pointer_pos - geo.loc - hotspot)
+                        .to_physical_precise_round(output_scale)
+                        .to_logical(output_scale)
+                        + geo.loc;
+                    let mut bbox = bbox_from_surface_tree(surface, (0, 0)).to_f64();
+                    bbox.loc += surface_pos;
+
                     if let Some(mut overlap) = geo.intersection(bbox) {
+                        overlaps = true;
                         overlap.loc -= surface_pos;
-                        cursor_scale =
-                            f64::max(cursor_scale, output.current_scale().fractional_scale());
+                        cursor_scale = f64::max(cursor_scale, output_scale);
                         // FIXME: using the largest overlapping or "primary" output transform would
                         // make more sense here.
                         cursor_transform = output.current_transform();
-                        output_update(output, Some(overlap), surface);
+                        output_update(output, Some(overlap.to_i32_up()), surface);
                     } else {
                         output_update(output, None, surface);
                     }
 
                     // Compute DnD icon surface overlap.
-                    if let Some((surface, bbox)) = dnd {
+                    if let Some(dnd_icon) = &self.dnd_icon {
+                        let surface = &dnd_icon.surface;
+
+                        // Rounding matching render_pointer().
+                        let surface_pos = (pointer_pos - geo.loc + dnd_icon.offset.to_f64())
+                            .to_physical_precise_round(output_scale)
+                            .to_logical(output_scale)
+                            + geo.loc;
+                        let mut bbox = bbox_from_surface_tree(surface, (0, 0)).to_f64();
+                        bbox.loc += surface_pos;
+
                         if let Some(mut overlap) = geo.intersection(bbox) {
+                            overlaps = true;
                             overlap.loc -= surface_pos;
                             dnd_scale =
                                 f64::max(dnd_scale, output.current_scale().fractional_scale());
                             // FIXME: using the largest overlapping or "primary" output transform
                             // would make more sense here.
                             dnd_transform = output.current_transform();
-                            output_update(output, Some(overlap), surface);
+                            output_update(output, Some(overlap.to_i32_up()), surface);
                         } else {
                             output_update(output, None, surface);
                         }
+                    }
+
+                    if overlaps {
+                        self.outputs_overlapping_pointer.push(output.clone());
                     }
                 }
 
@@ -4901,7 +5042,8 @@ impl Niri {
                         cursor_transform,
                     )
                 });
-                if let Some((surface, _)) = dnd {
+                if let Some(dnd_icon) = &self.dnd_icon {
+                    let surface = &dnd_icon.surface;
                     with_states(surface, |data| {
                         send_scale_transform(
                             surface,
@@ -4913,11 +5055,6 @@ impl Niri {
                 }
             }
             cursor_image => {
-                // There's no cursor surface, but there might be a DnD icon.
-                let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) else {
-                    return;
-                };
-
                 let icon = if let CursorImageStatus::Named(icon) = cursor_image {
                     *icon
                 } else {
@@ -4927,43 +5064,78 @@ impl Niri {
                 let mut dnd_scale = 1.;
                 let mut dnd_transform = Transform::Normal;
                 for output in self.global_space.outputs() {
-                    let geo = self.global_space.output_geometry(output).unwrap();
+                    let mut overlaps = false;
+                    let output_scale = output.current_scale().fractional_scale();
+                    let geo = self.global_space.output_geometry(output).unwrap().to_f64();
 
                     // The default cursor is rendered at the right scale for each output, which
                     // means that it may have a different hotspot for each output.
-                    let output_scale = output.current_scale().integer_scale();
+                    let cursor_scale = output.current_scale().integer_scale();
                     let cursor = self
                         .cursor_manager
-                        .get_cursor_with_name(icon, output_scale)
-                        .unwrap_or_else(|| self.cursor_manager.get_default_cursor(output_scale));
+                        .get_cursor_with_name(icon, cursor_scale)
+                        .unwrap_or_else(|| self.cursor_manager.get_default_cursor(cursor_scale));
 
-                    // For simplicity, we always use frame 0 for this computation. Let's hope the
-                    // hotspot doesn't change between frames.
-                    let hotspot = XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale);
+                    // There's no cursor surface, but there might be a DnD icon.
+                    if let Some(dnd_icon) = &self.dnd_icon {
+                        let surface = &dnd_icon.surface;
 
-                    let surface_pos = pointer_pos.to_i32_round() - hotspot;
-                    let bbox = bbox_from_surface_tree(surface, surface_pos);
+                        // Rounding matching render_pointer().
+                        let surface_pos = (pointer_pos - geo.loc + dnd_icon.offset.to_f64())
+                            .to_physical_precise_round(output_scale)
+                            .to_logical(output_scale)
+                            + geo.loc;
+                        let mut bbox = bbox_from_surface_tree(surface, (0, 0)).to_f64();
+                        bbox.loc += surface_pos;
 
-                    if let Some(mut overlap) = geo.intersection(bbox) {
-                        overlap.loc -= surface_pos;
-                        dnd_scale = f64::max(dnd_scale, output.current_scale().fractional_scale());
-                        // FIXME: using the largest overlapping or "primary" output transform would
-                        // make more sense here.
-                        dnd_transform = output.current_transform();
-                        output_update(output, Some(overlap), surface);
-                    } else {
-                        output_update(output, None, surface);
+                        if let Some(mut overlap) = geo.intersection(bbox) {
+                            overlaps = true;
+                            overlap.loc -= surface_pos;
+                            dnd_scale = f64::max(dnd_scale, output_scale);
+                            // FIXME: using the largest overlapping or "primary" output transform
+                            // would make more sense here.
+                            dnd_transform = output.current_transform();
+                            output_update(output, Some(overlap.to_i32_up()), surface);
+                        } else {
+                            output_update(output, None, surface);
+                        }
+                    }
+
+                    // Check the cursor image itself.
+                    if !overlaps {
+                        // For simplicity, we always use frame 0 for this computation. Let's hope
+                        // the hotspot doesn't change between frames.
+                        let frame = &cursor.frames()[0];
+                        let hotspot = XCursor::hotspot(frame).to_logical(cursor_scale);
+
+                        // Rounding matching render_pointer().
+                        let pos = (pointer_pos - geo.loc - hotspot.to_f64())
+                            .to_physical_precise_round(output_scale)
+                            .to_logical(output_scale)
+                            + geo.loc;
+                        let size = Size::new(f64::from(frame.width), f64::from(frame.height))
+                            / f64::from(cursor_scale);
+                        let bbox = Rectangle::new(pos, size);
+                        overlaps = geo.intersection(bbox).is_some();
+                    }
+
+                    if overlaps {
+                        self.outputs_overlapping_pointer.push(output.clone());
                     }
                 }
 
-                with_states(surface, |data| {
-                    send_scale_transform(
-                        surface,
-                        data,
-                        output::Scale::Fractional(dnd_scale),
-                        dnd_transform,
-                    );
-                });
+                if let Some(dnd_icon) = &self.dnd_icon {
+                    let surface = &dnd_icon.surface;
+
+                    with_states(surface, |data| {
+                        send_scale_transform(
+                            surface,
+                            data,
+                            output::Scale::Fractional(dnd_scale),
+                            dnd_transform,
+                        );
+                    });
+                }
             }
         }
     }
@@ -5435,12 +5607,10 @@ impl Niri {
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
-            push_popups_from_layer!(Layer::Top);
-            push_normal_from_layer!(Layer::Top);
-
-            push_popups_from_layer!(Layer::Bottom);
-            push_popups_from_layer!(Layer::Background);
-            push_normal_from_layer!(Layer::Bottom);
+            // Draw only the background layer, matching fill_xray_elements(). The idea is that with
+            // transparent fullscreen backdrop, the fullscreen window having or not having xray
+            // shouldn't change the visuals. This seems to match the visual intent people have when
+            // using a transparent fullscreen backdrop.
             push_normal_from_layer!(Layer::Background);
 
             // We don't expect more than one workspace when render_above_top_layer().
@@ -5624,6 +5794,7 @@ impl Niri {
 
         self.update_render_elements(Some(output));
 
+        let frame_was_locked = self.is_locked();
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
             let state = self.output_state.get_mut(output).unwrap();
@@ -5652,7 +5823,6 @@ impl Niri {
             res = backend.render(self, output, target_presentation_time);
         }
 
-        let is_locked = self.is_locked();
         let state = self.output_state.get_mut(output).unwrap();
 
         if res == RenderResult::Skipped {
@@ -5667,43 +5837,7 @@ impl Niri {
             };
         }
 
-        // Update the lock render state on successful render, or if monitors are inactive. When
-        // monitors are inactive on a TTY, they have no framebuffer attached, so no sensitive data
-        // from a last render will be visible.
-        if res != RenderResult::Skipped || !self.monitors_active {
-            state.lock_render_state = if is_locked {
-                LockRenderState::Locked
-            } else {
-                LockRenderState::Unlocked
-            };
-        }
-
-        // If we're in process of locking the session, check if the requirements were met.
-        match mem::take(&mut self.lock_state) {
-            LockState::Locking(confirmation) => {
-                if state.lock_render_state == LockRenderState::Unlocked {
-                    // We needed to render a locked frame on this output but failed.
-                    self.unlock();
-                } else {
-                    // Check if all outputs are now locked.
-                    let all_locked = self
-                        .output_state
-                        .values()
-                        .all(|state| state.lock_render_state == LockRenderState::Locked);
-
-                    if all_locked {
-                        // All outputs are locked, report success.
-                        let lock = confirmation.ext_session_lock().clone();
-                        confirmation.lock();
-                        self.lock_state = LockState::Locked(lock);
-                    } else {
-                        // Still waiting for other outputs.
-                        self.lock_state = LockState::Locking(confirmation);
-                    }
-                }
-            }
-            lock_state => self.lock_state = lock_state,
-        }
+        self.complete_lock_frame(output, res, frame_was_locked);
 
         self.refresh_on_demand_vrr(backend, output);
 
@@ -5734,8 +5868,68 @@ impl Niri {
 
             self.render_for_screencopy_with_damage(renderer, output);
             self.render_for_image_copy_capture(renderer, output, target_presentation_time);
+            self.render_windows_for_image_copy_capture(renderer, output, target_presentation_time);
             self.render_for_image_copy_cursor_capture(renderer, output, target_presentation_time);
         });
+    }
+
+    /// Records the security of the rendered frame only once submission has completed.
+    pub(crate) fn complete_lock_frame(
+        &mut self,
+        output: &Output,
+        result: RenderResult,
+        frame_was_locked: bool,
+    ) {
+        if result == RenderResult::Pending {
+            // Keep fence registrations and the last submitted frame's security state intact.
+            return;
+        }
+
+        let Some(state) = self.output_state.get_mut(output) else {
+            return;
+        };
+
+        if result == RenderResult::Skipped && self.monitors_active {
+            if frame_was_locked
+                && state.lock_render_state == LockRenderState::Unlocked
+                && matches!(self.lock_state, LockState::Locking(_))
+            {
+                // A failed protected frame must not acknowledge a lock over an unlocked output.
+                self.unlock();
+                return;
+            }
+            // A failed replacement leaves the previously submitted frame visible.
+            // It may already protect this output, so still check completion below.
+        } else {
+            // Inactive TTY outputs have no framebuffer attached. Otherwise, use the lock state
+            // captured when rendering, not the state when an asynchronous submission finishes.
+            state.lock_render_state = if frame_was_locked {
+                LockRenderState::Locked
+            } else {
+                LockRenderState::Unlocked
+            };
+        }
+
+        match mem::take(&mut self.lock_state) {
+            LockState::Locking(confirmation) => {
+                if self.all_outputs_locked() {
+                    let lock = confirmation.ext_session_lock().clone();
+                    confirmation.lock();
+                    self.lock_state = LockState::Locked(lock);
+                } else {
+                    self.lock_state = LockState::Locking(confirmation);
+                }
+            }
+            state => self.lock_state = state,
+        }
+    }
+
+    fn all_outputs_locked(&self) -> bool {
+        self.output_state.values().all(|state| {
+            state.lock_render_state == LockRenderState::Locked
+                // A previously locked output may now have an unlocked frame waiting on fences.
+                && !matches!(state.redraw_state, RedrawState::WaitingForFrameCompletion { .. })
+        })
     }
 
     pub fn refresh_on_demand_vrr(&mut self, backend: &mut Backend, output: &Output) {
@@ -6160,6 +6354,10 @@ impl Niri {
     }
 
     pub fn send_frame_callbacks(&mut self, output: &Output) {
+        if !self.monitors_active {
+            return;
+        }
+
         let _span = tracy_client::span!("Niri::send_frame_callbacks");
 
         let state = self.output_state.get(output).unwrap();
@@ -6463,13 +6661,10 @@ impl Niri {
 
                     screencopy.damage(damages);
 
-                    let render_result = Self::render_for_screencopy_internal(
-                        renderer,
-                        damage_tracker,
-                        &elements,
-                        states,
-                        screencopy,
-                    );
+                    let render_result =
+                        screencopy
+                            .buffer()
+                            .render(renderer, damage_tracker, &elements, states);
                     match render_result {
                         Ok(sync) => {
                             queue.pop().submit_after_sync(false, sync, &self.event_loop);
@@ -6537,13 +6732,9 @@ impl Niri {
 
             let (_damages, states) =
                 Self::damage_screencopy_internal(output, &elements, damage_tracker, &screencopy);
-            let res = Self::render_for_screencopy_internal(
-                renderer,
-                damage_tracker,
-                &elements,
-                states,
-                &screencopy,
-            );
+            let res = screencopy
+                .buffer()
+                .render(renderer, damage_tracker, &elements, states);
 
             if res.is_err() {
                 // Recreate damage tracker to report full damage next check.
@@ -6553,6 +6744,53 @@ impl Niri {
             res
         })
         .map(|sync| screencopy.submit_after_sync(false, sync, &self.event_loop))
+    }
+
+    /// Renders the elements into the frame's buffer and completes the frame.
+    ///
+    /// Returns `true` if it succeeded and `false` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_image_copy_frame<R: NiriCaptureRenderer>(
+        &self,
+        renderer: &mut R,
+        s: &mut ImageCopySession,
+        damage: Vec<Rectangle<i32, BufferCoords>>,
+        transform: Transform,
+        buffer_size: Size<i32, BufferCoords>,
+        elements: &[impl RenderElement<R>],
+        states: RenderElementStates,
+        target_presentation_time: Duration,
+    ) -> bool
+    where
+        R::Error: Send + Sync + 'static,
+    {
+        let frame = s.pending_frame.take().unwrap();
+        let buffer = frame.buffer();
+        let Some(capture_buffer) = image_copy_capture_impl::capture_buffer(&buffer, buffer_size)
+        else {
+            frame.fail(CaptureFailureReason::BufferConstraints);
+            return false;
+        };
+
+        let res = capture_buffer.render(renderer, &mut s.damage_tracker, elements, states);
+        match res {
+            Ok(sync) => {
+                image_copy_capture_impl::frame_success_after_sync(
+                    frame,
+                    transform,
+                    damage,
+                    target_presentation_time,
+                    sync,
+                    &self.event_loop,
+                );
+                true
+            }
+            Err(err) => {
+                warn!("error rendering for image copy capture: {err:?}");
+                frame.fail(CaptureFailureReason::Unknown);
+                false
+            }
+        }
     }
 
     pub fn render_for_image_copy_capture<R: NiriCaptureRenderer>(
@@ -6574,6 +6812,7 @@ impl Niri {
         };
 
         let _span = tracy_client::span!("Niri::render_for_image_copy_capture");
+
         if !self.image_copy_sessions.iter().any(|s| {
             s.pending_frame.is_some()
                 && image_copy_capture_impl::source_output(&s.session.source()).as_ref()
@@ -6608,17 +6847,7 @@ impl Niri {
                 }
 
                 // Recreate the damage tracker if the output changed.
-                let OutputModeSource::Static {
-                    size: last_size,
-                    scale: last_scale,
-                    transform: last_transform,
-                } = s.damage_tracker.mode().clone()
-                else {
-                    unreachable!("damage tracker must have static mode");
-                };
-                if size != last_size || scale != last_scale || transform != last_transform {
-                    s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
-                }
+                reset_damage_tracker_if_changed(&mut s.damage_tracker, size, scale, transform);
 
                 let draw_cursor = s.session.draw_cursor();
                 let cached = &mut cached_elements[usize::from(draw_cursor)];
@@ -6654,54 +6883,135 @@ impl Niri {
                     })
                     .collect();
 
-                let frame = s.pending_frame.take().unwrap();
-                let buffer = frame.buffer();
                 let buffer_size = Size::<i32, BufferCoords>::from((size.w, size.h));
-                let capture_buffer = image_copy_capture_impl::capture_buffer(
-                    &buffer,
+                if !self.capture_image_copy_frame(
+                    renderer,
+                    s,
+                    damage,
+                    transform,
                     buffer_size,
-                    wl_shm::Format::Xrgb8888,
-                );
-                let Some(capture_buffer) = capture_buffer else {
-                    frame.fail(CaptureFailureReason::BufferConstraints);
+                    elements,
+                    states,
+                    target_presentation_time,
+                ) {
                     // Report full damage next time.
                     s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
+                }
+            }
+
+            if !self.image_copy_sessions.is_empty() {
+                error!("session added while rendering image-copy-capture frame");
+                sessions.append(&mut self.image_copy_sessions);
+            }
+            self.image_copy_sessions = sessions;
+        });
+    }
+
+    pub fn render_windows_for_image_copy_capture<R: NiriCaptureRenderer>(
+        &mut self,
+        renderer: &mut R,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) where
+        R::Error: Send + Sync + 'static,
+        WindowCaptureRenderElement<R>: RenderElement<R>,
+    {
+        let _span = tracy_client::span!("Niri::render_windows_for_image_copy_capture");
+
+        if !self.image_copy_sessions.iter().any(|s| {
+            s.pending_frame.is_some()
+                && image_copy_capture_impl::source_mapped_id(&s.session.source())
+                    .and_then(|id| self.find_mapped_output_by_id(id))
+                    .and_then(|(_, output)| output)
+                    == Some(output)
+        }) {
+            return;
+        }
+
+        let scale: Scale<f64> = output.current_scale().fractional_scale().into();
+        let reference_luminance = self.output_capture_reference_luminance(output);
+        with_sdr_capture(renderer, reference_luminance, |renderer| {
+            let mut sessions = mem::take(&mut self.image_copy_sessions);
+            for s in &mut sessions {
+                if s.pending_frame.is_none() {
+                    continue;
+                }
+
+                let source = s.session.source();
+                let Some(id) = image_copy_capture_impl::source_mapped_id(&source) else {
+                    continue;
+                };
+                let Some((mapped, Some(win_output))) = self.find_mapped_output_by_id(id) else {
+                    continue;
+                };
+                if *win_output != *output {
+                    continue;
+                }
+
+                let bbox = mapped.capture_bbox(scale);
+                let size = bbox.size;
+                let buffer_size = Size::<_, BufferCoords>::from((size.w, size.h));
+
+                // Recreate the damage tracker if the buffer size or output scale changed.
+                reset_damage_tracker_if_changed(
+                    &mut s.damage_tracker,
+                    size,
+                    scale,
+                    Transform::Normal,
+                );
+
+                let mut elements = Vec::new();
+                if s.session.draw_cursor() && self.pointer_visibility.is_visible() {
+                    // We ignore pointer_pos, but we're drawing in output coordinates, so it's fine.
+                    if let Some((_, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
+                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                        let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
+                        self.render_pointer(renderer, output, &mut |elem| {
+                            elements.push(WindowCaptureRenderElement::Pointer(
+                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative),
+                            ));
+                        });
+                    }
+                }
+
+                let ctx = RenderCtx {
+                    renderer,
+                    // Consistent with outputs and wlr-screencopy.
+                    target: RenderTarget::ScreenCapture,
+                    xray: None,
+                };
+                mapped.render_for_screen_cast(ctx, scale, &mut |elem| {
+                    elements.push(WindowCaptureRenderElement::Window(elem));
+                });
+
+                let (damage, states) = s.damage_tracker.damage_output(1, &elements).unwrap();
+                let Some(damage) = damage else {
+                    // No damage, capture the frame later.
                     continue;
                 };
 
-                let res = match capture_buffer {
-                    CaptureBuffer::Dma(dmabuf) => {
-                        render_to_dmabuf(renderer, &mut s.damage_tracker, dmabuf, elements, states)
-                            .map(Some)
-                    }
-                    CaptureBuffer::Shm => render_to_shm(
-                        renderer,
-                        &mut s.damage_tracker,
-                        &buffer,
-                        wl_shm::Format::Xrgb8888,
-                        elements,
-                        states,
-                    )
-                    .map(|()| None),
-                };
+                let damage: Vec<Rectangle<i32, BufferCoords>> = damage
+                    .iter()
+                    .map(|dmg| {
+                        Rectangle::new(
+                            (dmg.loc.x, dmg.loc.y).into(),
+                            (dmg.size.w, dmg.size.h).into(),
+                        )
+                    })
+                    .collect();
 
-                match res {
-                    Ok(sync) => {
-                        image_copy_capture_impl::frame_success_after_sync(
-                            frame,
-                            transform,
-                            damage,
-                            target_presentation_time,
-                            sync,
-                            &self.event_loop,
-                        );
-                    }
-                    Err(err) => {
-                        warn!("error rendering for image copy capture: {err:?}");
-                        frame.fail(CaptureFailureReason::Unknown);
-                        // Report full damage next time.
-                        s.damage_tracker = OutputDamageTracker::new(size, scale, transform);
-                    }
+                if !self.capture_image_copy_frame(
+                    renderer,
+                    s,
+                    damage,
+                    Transform::Normal,
+                    buffer_size,
+                    &elements,
+                    states,
+                    target_presentation_time,
+                ) {
+                    // Report full damage next time.
+                    s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
                 }
             }
 
@@ -6726,9 +7036,11 @@ impl Niri {
         PointerRenderElements<R>: RenderElement<R>,
     {
         let _span = tracy_client::span!("Niri::render_for_image_copy_cursor_capture");
+
         if !self.image_copy_cursor_sessions.iter().any(|s| {
             s.pending_frame.is_some()
-                && image_copy_capture_impl::source_output(&s.session.source()).as_ref()
+                && image_copy_capture_impl::source_session_output(self, &s.session.source())
+                    .as_ref()
                     == Some(output)
         }) {
             return;
@@ -6738,14 +7050,16 @@ impl Niri {
         let reference_luminance = self.output_capture_reference_luminance(output);
         with_sdr_capture(renderer, reference_luminance, |renderer| {
             // The cursor render is the same for all sessions on the output.
-            let mut cached_elements = None;
+            let mut cached_cursor = None;
 
             let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
             for s in &mut sessions {
                 if s.pending_frame.is_none() {
                     continue;
                 }
-                let Some(s_output) = image_copy_capture_impl::source_output(&s.session.source())
+
+                let Some(s_output) =
+                    image_copy_capture_impl::source_session_output(self, &s.session.source())
                 else {
                     continue;
                 };
@@ -6753,62 +7067,61 @@ impl Niri {
                     continue;
                 }
 
-                // The constraints are kept up to date with the cursor image size in
-                // refresh_image_copy_cursor_sessions, which also fails pending frames on change.
-                let Some(constraints) = s.session.current_constraints() else {
-                    let frame = s.pending_frame.take().unwrap();
-                    frame.fail(CaptureFailureReason::BufferConstraints);
+                let (elements, geometry) = cached_cursor
+                    .get_or_insert_with(|| self.render_cursor_for_capture(renderer, output));
+
+                let size_changed = s
+                    .session
+                    .current_constraints()
+                    .is_none_or(|c| (c.size.w, c.size.h) != (geometry.size.w, geometry.size.h));
+                if size_changed {
+                    // Cannot capture a frame for outdated constraints, so fail it
+                    // before sending the new constraints (otherwise clients which
+                    // re-negotiate on failure may miss the new `done`).
+                    if let Some(frame) = s.pending_frame.take() {
+                        frame.fail(CaptureFailureReason::BufferConstraints);
+                    }
+                    let constraints =
+                        image_copy_capture_impl::cursor_capture_constraints(geometry.size);
+                    s.session.update_constraints(constraints);
                     continue;
-                };
-                let size = Size::<i32, Physical>::from((constraints.size.w, constraints.size.h));
+                }
+                // Buffer -> Physical
+                let size = Size::<i32, Physical>::new(geometry.size.w, geometry.size.h);
 
                 // Recreate the damage tracker if the cursor buffer size or output scale changed.
-                let OutputModeSource::Static {
-                    size: last_size,
-                    scale: last_scale,
-                    ..
-                } = s.damage_tracker.mode().clone()
-                else {
-                    unreachable!("damage tracker must have static mode");
-                };
-                if size != last_size || scale != last_scale {
-                    s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
-                }
-
-                let elements = cached_elements
-                    .get_or_insert_with(|| self.render_cursor_for_capture(renderer, output));
+                reset_damage_tracker_if_changed(
+                    &mut s.damage_tracker,
+                    size,
+                    scale,
+                    Transform::Normal,
+                );
 
                 let (damage, states) = s.damage_tracker.damage_output(1, elements).unwrap();
                 if damage.is_none() {
-                    // No change, capture the frame later.
+                    // Hotspot metadata is updated independently in
+                    // refresh_image_copy_cursor_sessions().
                     continue;
                 }
 
                 let frame = s.pending_frame.take().unwrap();
                 let buffer = frame.buffer();
-                let capture_buffer = image_copy_capture_impl::capture_buffer(
-                    &buffer,
-                    constraints.size,
-                    wl_shm::Format::Argb8888,
-                );
-                if !matches!(capture_buffer, Some(CaptureBuffer::Shm)) {
+                let capture_buffer =
+                    image_copy_capture_impl::capture_buffer(&buffer, geometry.size);
+                if !matches!(capture_buffer, Some(CaptureBuffer::Shm(_))) {
                     frame.fail(CaptureFailureReason::BufferConstraints);
                     // Report full damage next time.
                     s.damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
                     continue;
                 }
 
-                let res = render_to_shm(
-                    renderer,
-                    &mut s.damage_tracker,
-                    &buffer,
-                    wl_shm::Format::Argb8888,
-                    elements,
-                    states,
-                );
+                let res = render_to_shm(renderer, &mut s.damage_tracker, &buffer, elements, states);
                 match res {
                     Ok(()) => {
-                        let full_damage = vec![Rectangle::from_size(constraints.size)];
+                        s.session
+                            .set_cursor_hotspot((geometry.hotspot.x, geometry.hotspot.y));
+
+                        let full_damage = vec![Rectangle::from_size(geometry.size)];
                         frame.success(Transform::Normal, full_damage, target_presentation_time);
                     }
                     Err(err) => {
@@ -6835,56 +7148,46 @@ impl Niri {
         &self,
         renderer: &mut R,
         output: &Output,
-    ) -> Vec<PointerRenderElements<R>> {
-        let int_scale = output.current_scale().integer_scale();
-        let output_scale = Scale::from(output.current_scale().fractional_scale());
+    ) -> (
+        Vec<RelocateRenderElement<PointerRenderElements<R>>>,
+        CursorCaptureGeometry,
+    ) {
+        let output_scale = output.current_scale();
+        let scale = Scale::from(output_scale.fractional_scale());
 
         let mut elements = Vec::new();
-        match self.cursor_manager.get_render_cursor(int_scale) {
-            RenderCursor::Hidden => (),
-            RenderCursor::Surface { surface, .. } => {
-                // Subsurfaces can extend above or to the left of the root surface, so shift the
-                // tree to put its bounding box at the origin. The hotspot is shifted to match in
-                // cursor_capture_hotspot().
-                let bbox = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
-                let loc = Point::<i32, Logical>::from((-bbox.loc.x, -bbox.loc.y))
-                    .to_f64()
-                    .to_physical_precise_round(output_scale);
-                push_elements_from_surface_tree(
-                    renderer,
-                    &surface,
-                    loc,
-                    output_scale,
-                    1.,
-                    Kind::Cursor,
-                    &mut |elem| elements.push(elem.into()),
-                );
-            }
-            RenderCursor::Named {
-                icon,
-                scale,
-                cursor,
-            } => {
-                let (idx, _frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
-                match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    Point::<f64, _>::from((0., 0.)),
-                    &texture,
-                    None,
-                    None,
-                    None,
-                    Kind::Cursor,
-                ) {
-                    Ok(element) => elements.push(element.into()),
-                    Err(err) => {
-                        warn!("error importing a cursor texture: {err:?}");
-                    }
-                }
-            }
+        self.render_pointer(renderer, output, &mut |elem| elements.push(elem));
+
+        // We need the elements at (0, 0) for damage tracking.
+        let geo = encompassing_geo(scale, elements.iter());
+        let off = geo.loc.upscale(-1);
+
+        let elements = elements
+            .into_iter()
+            .map(|elem| RelocateRenderElement::from_element(elem, off, Relocate::Relative))
+            .collect();
+
+        let output_loc = self.global_space.output_geometry(output).unwrap().loc;
+        let pointer_loc = self
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        let hotspot =
+            (pointer_loc - output_loc.to_f64()).to_physical_precise_round(scale) - geo.loc;
+
+        // Physical -> Buffer
+        let mut size = Size::new(geo.size.w, geo.size.h);
+        let hotspot = Point::new(hotspot.x, hotspot.y);
+
+        // Fall back to the nominal cursor size when the cursor is currently hidden or has no
+        // buffer, so that the session always has valid constraints.
+        if size.is_empty() {
+            let int_scale = output_scale.integer_scale();
+            let fallback = i32::from(self.config.borrow().cursor.xcursor_size) * int_scale;
+            size = Size::from((fallback, fallback));
         }
 
-        elements
+        let geometry = CursorCaptureGeometry { size, hotspot };
+        (elements, geometry)
     }
 
     /// Sends cursor position, hotspot and size to cursor sessions independently
@@ -6902,69 +7205,82 @@ impl Niri {
 
         let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
         for s in &mut sessions {
-            let Some(output) = image_copy_capture_impl::source_output(&s.session.source()) else {
-                s.session.set_cursor_pos(None);
-                continue;
-            };
-            let Some(geo) = self.global_space.output_geometry(&output) else {
-                s.session.set_cursor_pos(None);
-                continue;
-            };
-            let Some(mode) = output.current_mode() else {
+            let source = s.session.source();
+
+            let (mapped, output) =
+                if let Some(id) = image_copy_capture_impl::source_mapped_id(&source) {
+                    let Some((mapped, Some(output))) = self.find_mapped_output_by_id(id) else {
+                        s.session.set_cursor_pos(None);
+                        continue;
+                    };
+                    (Some(mapped), output.clone())
+                } else {
+                    let Some(output) = image_copy_capture_impl::source_output(&source) else {
+                        s.session.set_cursor_pos(None);
+                        continue;
+                    };
+                    (None, output)
+                };
+
+            let Some(output_geo) = self.global_space.output_geometry(&output) else {
                 s.session.set_cursor_pos(None);
                 continue;
             };
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-
-            // Update the constraints if the cursor image size changed.
-            let constraints = image_copy_capture_impl::cursor_capture_constraints(self, &output);
-            let cursor_size = constraints.size;
-            let size_changed = s
-                .session
-                .current_constraints()
-                .is_none_or(|c| (c.size.w, c.size.h) != (constraints.size.w, constraints.size.h));
-            if size_changed {
-                // Cannot capture a frame for outdated constraints, so fail it
-                // before sending the new constraints (otherwise clients which
-                // re-negotiate on failure may miss the new `done`).
-                if let Some(frame) = s.pending_frame.take() {
-                    frame.fail(CaptureFailureReason::BufferConstraints);
-                }
-                s.session.update_constraints(constraints);
-            }
-
             let hotspot = image_copy_capture_impl::cursor_capture_hotspot(self, &output);
             s.session.set_cursor_hotspot((hotspot.x, hotspot.y));
 
-            // Unlike frame damage, the position is in transformed buffer coordinates, i.e. the
-            // displayed orientation, so the output transform is not undone here. This matches
-            // wlroots.
-            let pos: Point<i32, Physical> =
-                (pointer_pos - geo.loc.to_f64()).to_physical_precise_round(scale);
-
-            // Cursors are considered to have entered if any part of the image
-            // intersects the output, not just the hotspot, so the position may
-            // be negative or past the edge.
-            //
-            // The imagecopy protocol specifies this interpretation
-            // specifically, even though it differs from wl_pointer.enter,
-            // including the coordinates being outside the output bounds. This
-            // is also how wlroots implements it.
-            //
-            // This intentionally differs from how PipeWire casts work since PW
-            // requires the pointer to be within the output bounds, but this
-            // isn't relevant (or wanted) for the imagecopy protocol.
-            let hotspot = Point::<i32, Physical>::from((hotspot.x, hotspot.y));
-            let image = Rectangle::new(pos - hotspot, Size::from((cursor_size.w, cursor_size.h)));
-            let output_rect =
-                Rectangle::from_size(output.current_transform().transform_size(mode.size));
-            if self.pointer_visibility.is_visible() && image.overlaps(output_rect) {
-                // not geo.to_f64().contains(pointer_pos)
-                s.session.set_cursor_pos(Some(Point::from((pos.x, pos.y))));
+            let pos = if !self.pointer_visibility.is_visible() {
+                None
+            } else if let Some(mapped) = mapped {
+                // For window casts, we intentionally use the same logic as in PipeWire: the window
+                // must have pointer focus to show the pointer. The reasoning is to prevent
+                // accidental leaking of pointer position when not interacting with the window.
+                //
+                // While this may seem to contradict the protocol wording, I'd argue one of the
+                // readings does allow it.
+                //
+                // > The cursor enters the captured area when the cursor image
+                // > intersects with the captured area.
+                //
+                // For windows, the captured area is the window itself, not a cut-out of the output.
+                // Therefore, we consider the pointer to not intersect the "captured area" when the
+                // window doesn't have pointer focus. (Otherwise the pointer would need to be
+                // displayed even when it's over a different window completely covering the casted
+                // one.)
+                self.pointer_pos_for_window_cast(mapped)
+                    .map(|(pointer_pos, win_pos)| {
+                        let bbox = mapped.capture_bbox(scale);
+                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                        let ipos = (pointer_pos - output_geo.loc.to_f64() - buf_pos)
+                            .to_physical_precise_round(scale);
+                        Point::from((ipos.x, ipos.y))
+                    })
             } else {
-                s.session.set_cursor_pos(None);
-            }
+                // Cursors are considered to have entered if any part of the image
+                // intersects the output, not just the hotspot, so the position may
+                // be negative or past the edge.
+                //
+                // The imagecopy protocol specifies this interpretation
+                // specifically, even though it differs from wl_pointer.enter,
+                // including the coordinates being outside the output bounds. This
+                // is also how wlroots implements it.
+                //
+                // This intentionally differs from how PipeWire casts work since PW
+                // requires the pointer to be within the output bounds, but this
+                // isn't relevant (or wanted) for the imagecopy protocol.
+                self.outputs_overlapping_pointer.contains(&output).then(|| {
+                    // Unlike frame damage, the position is in transformed buffer coordinates,
+                    // i.e. the displayed orientation, so the output transform is not undone here.
+                    // This matches wlroots.
+                    let pos: Point<i32, Physical> =
+                        (pointer_pos - output_geo.loc.to_f64()).to_physical_precise_round(scale);
+
+                    Point::from((pos.x, pos.y))
+                })
+            };
+            s.session.set_cursor_pos(pos);
         }
         // This shouldn't be possible since sessions are only added from the
         // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
@@ -6985,57 +7301,40 @@ impl Niri {
         Option<&'a Vec<Rectangle<i32, Physical>>>,
         RenderElementStates,
     ) {
-        let OutputModeSource::Static {
-            size: last_size,
-            scale: last_scale,
-            transform: last_transform,
-        } = damage_tracker.mode().clone()
-        else {
-            unreachable!("damage tracker must have static mode");
-        };
-
         let size = screencopy.buffer_size();
         let scale: Scale<f64> = output.current_scale().fractional_scale().into();
         let transform = output.current_transform();
 
-        if size != last_size || scale != last_scale || transform != last_transform {
-            *damage_tracker = OutputDamageTracker::new(size, scale, transform);
-        }
+        reset_damage_tracker_if_changed(damage_tracker, size, scale, transform);
 
         // Just checked damage tracker has static mode
         damage_tracker.damage_output(1, elements).unwrap()
     }
 
-    #[allow(clippy::type_complexity)]
-    fn render_for_screencopy_internal<R: NiriCaptureRenderer>(
-        renderer: &mut R,
-        damage_tracker: &mut OutputDamageTracker,
-        elements: &[impl RenderElement<R>],
-        states: RenderElementStates,
-        screencopy: &Screencopy,
-    ) -> anyhow::Result<Option<SyncPoint>> {
-        let sync = match screencopy.buffer() {
-            ScreencopyBuffer::Dmabuf(dmabuf) => {
-                let sync =
-                    render_to_dmabuf(renderer, damage_tracker, dmabuf.clone(), elements, states)
-                        .context("error rendering to screencopy dmabuf")?;
-                Some(sync)
-            }
-            ScreencopyBuffer::Shm(wl_buffer) => {
-                render_to_shm(
-                    renderer,
-                    damage_tracker,
-                    wl_buffer,
-                    wl_shm::Format::Xrgb8888,
-                    elements,
-                    states,
-                )
-                .context("error rendering to screencopy shm buffer")?;
-                None
-            }
-        };
+    pub fn refresh_mapped_cast_window_rules(&mut self) {
+        // O(N^2) but should be fine since there aren't many casts usually.
+        self.layout.with_windows_mut(|mapped, _| {
+            let id = mapped.id();
 
-        Ok(sync)
+            let mut value = false;
+            // Same as for IPC, one-shot screenshots aren't casts.
+            for session in self.image_copy_sessions.iter().filter(|s| s.is_cast()) {
+                let source = session.session.source();
+                if image_copy_capture_impl::source_mapped_id(&source) == Some(id) {
+                    value = true;
+                    break;
+                }
+            }
+
+            #[cfg(feature = "xdp-gnome-screencast")]
+            if !value {
+                let id = CastTarget::Window { id: id.get() };
+                // Find regardless of cast.is_active.
+                value = self.casting.casts.iter().any(|cast| cast.target == id);
+            }
+
+            mapped.set_is_window_cast_target(value);
+        });
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
@@ -7509,6 +7808,19 @@ impl Niri {
         });
 
         Ok(())
+    }
+
+    pub fn clear_input_state(&mut self) {
+        self.suppressed_keys.clear();
+        self.suppressed_buttons.clear();
+        self.pending_release_binds.clear();
+        self.pending_mouse_release_binds.clear();
+        self.pending_tablet_release_binds.clear();
+
+        // Stop ongoing key repeat if any.
+        if let Some(token) = self.bind_repeat_timer.take() {
+            self.event_loop.remove(token);
+        }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -8292,6 +8604,13 @@ niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = BlendSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
+    }
+}
+
+niri_render_elements! {
+    WindowCaptureRenderElement<R> => {
+        Window = WindowCastRenderElements<R>,
+        Pointer = RelocateRenderElement<PointerRenderElements<R>>,
     }
 }
 

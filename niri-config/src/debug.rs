@@ -30,6 +30,7 @@ pub struct Debug {
     pub disable_10bit_output: bool,
     pub force_tearing: bool,
     pub vulkan_renderer: bool,
+    pub nested_show_host_cursor: bool,
 }
 
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
@@ -86,6 +87,8 @@ pub struct DebugPart {
     pub force_tearing: Option<Flag>,
     #[knuffel(child)]
     pub vulkan_renderer: Option<Flag>,
+    #[knuffel(child)]
+    pub nested_show_host_cursor: Option<Flag>,
 }
 
 impl MergeWith<DebugPart> for Debug {
@@ -115,6 +118,7 @@ impl MergeWith<DebugPart> for Debug {
             disable_10bit_output,
             force_tearing,
             vulkan_renderer,
+            nested_show_host_cursor,
         );
 
         merge_clone_opt!((self, part), preview_render, render_drm_device);
