@@ -189,7 +189,11 @@ fn another_output_cannot_confirm_lock_over_pending_unlocked_frame() {
 fn failed_pending_frame_retains_protected_output_and_completes_lock() {
     let (mut f, id, events) = locking_fixture();
     let output = f.niri_output(1);
-    f.niri().output_state.get_mut(&output).unwrap().lock_render_state = LockRenderState::Locked;
+    f.niri()
+        .output_state
+        .get_mut(&output)
+        .unwrap()
+        .lock_render_state = LockRenderState::Locked;
     f.niri()
         .complete_lock_frame(&output, RenderResult::Pending, true);
     assert!(matches!(f.niri().lock_state, LockState::Locking(_)));
