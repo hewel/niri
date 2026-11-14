@@ -166,19 +166,14 @@ impl Xray {
         XrayFrame { xray: self }
     }
 
-    /// Uses the capture-safe background while baking a snapshot, without changing the
-    /// window's render target. When no layers are sensitive, reuse the output capture.
+    /// Routes the background independently of the window's own capture target.
+    /// The caller supplies a target prepared in this frame (or an equivalent Output).
     /// The normal target selection is restored even on an early return or unwind.
     pub fn with_snapshot_background<T>(
         &self,
-        has_blocked_out_layers: bool,
+        target: RenderTarget,
         render: impl FnOnce(&Self) -> T,
     ) -> T {
-        let target = if has_blocked_out_layers {
-            RenderTarget::Screencast
-        } else {
-            RenderTarget::Output
-        };
         let _route = SnapshotRoute {
             target: &self.snapshot_target,
             previous: self.snapshot_target.replace(Some(target)),

@@ -468,7 +468,7 @@ fn xray_snapshot_background_is_capture_safe_and_restored_after_error() {
     for (target, expected) in targets.into_iter().zip(expected) {
         assert_eq!(draw(&xray, target), expected);
     }
-    let result: Result<(), ()> = xray.with_snapshot_background(true, |xray| {
+    let result: Result<(), ()> = xray.with_snapshot_background(RenderTarget::Screencast, |xray| {
         // The window can remain unblocked, but its background is always capture-safe.
         for target in targets {
             assert_eq!(draw(xray, target), expected[1]);
@@ -479,7 +479,7 @@ fn xray_snapshot_background_is_capture_safe_and_restored_after_error() {
     for (target, expected) in targets.into_iter().zip(expected) {
         assert_eq!(draw(&xray, target), expected);
     }
-    xray.with_snapshot_background(false, |xray| {
+    xray.with_snapshot_background(RenderTarget::Output, |xray| {
         // No sensitive layers: reuse the already prepared output, not another capture.
         for target in targets {
             assert_eq!(draw(xray, target), expected[0]);

@@ -807,6 +807,7 @@ mod tests {
                 }
 
                 tab-indicator {
+                    show-title true
                     width 10
                     position "top"
                 }
@@ -1427,6 +1428,7 @@ mod tests {
                 },
                 tab_indicator: TabIndicator {
                     off: false,
+                    show_title: true,
                     hide_when_single_tab: false,
                     place_within_column: false,
                     gap: 5.0,

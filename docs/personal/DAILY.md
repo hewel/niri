@@ -40,7 +40,8 @@ validation, record `result: "approved-for-daily-trial"`, `source: "user-authoriz
 the exact `binary_sha256`, their `user_request`, and a `scope` distinguishing completed
 checks from unverified ones. This requires an actual user instruction; automated
 checks alone never authorize installation. Status preserves this distinction.
-Never relabel authorization as observed success or copy acceptance to a newer hash.
+Never claim observed success without a new user observation of that exact hash,
+or copy acceptance to a newer hash.
 The artifact and initial acceptance record are copied together before configuration
 validation, so replacing either caller path cannot change the validated build.
 Authentication occurs only after those staged bytes pass validation; a separately
@@ -55,11 +56,24 @@ copies are verified. A login pins one bundle for migration, validation and compo
 startup, even if a different build is selected in the meantime. Already executing
 files are not truncated. Old bundles are retained; there is no automatic deletion.
 
+Updating only the acceptance record creates a new immutable bundle but preserves
+the existing rollback selection. Runtime identity compares the verified contents of
+`niri`, `session.sh` and `unify-config.py`, not acceptance metadata. Changing any of
+those three files is a runtime update. If there was no rollback build, a metadata-only
+update does not invent one. Old evidence bundles remain on disk.
+
+Published store, releases and bundle directories have explicit `0755` permissions,
+independent of the publisher's umask. Missing parent directories created by deployment
+also receive `0755`; existing general system directories keep their administrator-set
+permissions. There is no recursive permission relaxation. Private staging directories
+remain private, and symlink aliases for the dedicated deployment directories are refused.
+
 On the first run against the earlier flat installation, its accepted binary is imported
 as a rollback build using the current session helpers. If it differs from the selected
 artifact, supply its actual acceptance record with `--previous-acceptance PATH`.
-An unrecorded installed binary is never silently treated as accepted. If both binaries
-and their bundle files are identical, no redundant rollback copy is invented.
+An unrecorded installed binary is never silently treated as accepted. If the imported
+legacy build and candidate have identical runtime contents, differing acceptance records
+do not create a duplicate rollback selection. The legacy evidence bundle is retained.
 The earlier flat files are retained for interrupted-bootstrap recovery. A legacy
 wrapper already running during bootstrap has no bundle pin; its eventual service
 handoff uses only the retained flat executable, verified against the accepted SHA
@@ -111,10 +125,39 @@ replacement. Keep `original/` for the system-provided Niri fallback.
 
 If preparation itself failed before producing `manifest.json`, preserve that incomplete
 directory elsewhere and prepare again. If a manifest says `applying`, retry a personal
-login from the login screen: the helper recovers an interrupted write only when files
-still contain its known old/new bytes. If subsequent user edits exist, it stops and
-requires manual reconciliation with `original/` and `candidate/`. Updates refuse an
-unresolved `applying` state; they do not guess how to recover configuration.
+login from the login screen: the helper recovers an interrupted write only when live
+and retained files still contain its known old/new bytes. If user edits or uncertain
+recovery evidence exist, it stops before service startup and requires manual
+reconciliation. Updates refuse an unresolved `applying` state; they do not guess how
+to recover configuration. Existing prepared/applying manifests remain usable.
+
+All forward, recovery and rollback writes use Linux `renameat2(RENAME_EXCHANGE)`.
+Before exchange, the helper creates a private `recovery/replace-*/` directory inside
+the stage with a replacement file named `saved` and an `intent.json` containing the
+target path, replacement inode and allowed content hashes. Exchange atomically puts
+the replacement at the live path and moves the actual displaced inode into `saved`.
+There is no missing-path interval. Unsupported exchange or a stage on a different
+filesystem fails safely; there is no overwrite-based fallback.
+
+After a process interruption, the saved inode identifies whether exchange occurred.
+An unexchanged replacement is not treated as a displaced user file. Unedited
+interruptions continue automatic recovery. Files displaced by any completed exchange
+are retained even after success, including writes an editor later makes through an
+already-open file descriptor. Retained content is checked on subsequent apply/login,
+even when the main manifest is already `applied`. The migration lock serializes only
+migration processes; it does not assume editors cooperate. These are process-crash
+guarantees, not a claim of power-loss durability.
+
+A save racing with exchange may be in `recovery/replace-*/saved`, rather than at the
+live path. The helper stops when it detects that conflict; it does not overwrite it
+again to attempt automatic rollback. Inspect each `intent.json` to identify its
+target, and compare the saved file with the live config, `original/` and `candidate/`.
+Do not delete recovery evidence or change journal states to force a retry. Preserve
+the whole stage before manual reconciliation. Once the intended live configuration
+has been reconciled and validated with the selected accepted binary, retain the old
+stage elsewhere instead of leaving it at `.pending-personal`; login then validates
+the reconciled live config without replaying that migration. Do not reprepare an
+already-migrated config blindly.
 
 Historical configuration/deployment evidence remains under `personal/daily/`, including
 `unified-installation.json`, `installation.json` and `smooth-installation.json`.
@@ -131,13 +174,20 @@ prepared migration candidate), then selects it for the next login. It preserves 
 current configuration files. If the older build cannot read them, selection is refused:
 review the diagnostic and make a deliberate compatible configuration edit, or retain
 the current build. No saved configuration is restored automatically. Repeating rollback
-switches between the last two selections.
+switches between the last two selections. Rollback changes no system entry files and
+does not run `systemctl --user daemon-reload`; it needs no user-manager connection
+for metadata reload.
 
 If publishing was interrupted, rerun the original install command. Complete bundles
 are reused and verified, incomplete copies are removed under the deployment lock, and
-a changed selection causes a clear retry diagnostic. A failure of `daemon-reload`
-occurs after selection; rerun installation to retry metadata reload without losing the
-rollback selection. No service is automatically started or restarted.
+a changed selection causes a clear retry diagnostic.
+
+Installation reloads user-unit metadata only after publication succeeds. If this
+post-selection step fails, the command exits nonzero but explicitly reports the build
+already selected and its rollback selection: the version switch has not been undone.
+Retry the same install command with unchanged artifact and acceptance files once the
+user manager is available; this preserves the rollback selection. Do not use `rollback`
+to retry a failed metadata reload. No service is automatically started or restarted.
 
 ## Returning to the system-provided Niri
 
@@ -164,8 +214,12 @@ silently restore custom settings.
 Run `python3 scripts/test-personal-deploy.py`. It exercises initial installation,
 accepted updates, repeated retries, privilege failure, importing the old flat layout,
 interrupted publication, stale selection, staged-content or plan tampering, caller-path replacement during validation, legacy
-login handoff during bootstrap, config preservation
+login handoff during bootstrap, config preservation, restrictive-umask publication,
+metadata-only acceptance updates, runtime-helper updates, post-selection reload failures
 and incompatible rollback through the deployment module using temporary filesystems.
-The prior ten migration recovery/edit-preservation cases are now reproducible in this
-same tracked suite. Tests do not request root or install session files. Real GDM login
-and policy authentication remain separate host checks.
+The migration cases cover old journals, deterministic process interruption before
+and after exchange, interruption during recovery, editor saves between recovery
+writes and at the final replacement boundary, late saves through old file descriptors,
+unsupported exchange, and real session-shell refusal on conflict. Tests do not request
+root or install session files. Real GDM login and policy authentication remain separate
+host checks.

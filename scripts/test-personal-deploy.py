@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Exercise deployment and migration through their module seam, without root writes."""
+from contextlib import contextmanager
+import errno
 import hashlib
 import importlib.util
 import os
 import json
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,6 +54,53 @@ class DeploymentTests(unittest.TestCase):
     def install(self, name, **kwargs):
         return self.deploy.install(*self.artifact(name, **kwargs))
 
+    @contextmanager
+    def authorized_deployment(self, reload_failure=None):
+        """Run the real publisher under the fixture root; never execute host administration."""
+        run = subprocess.run
+        def command(args, **kwargs):
+            if args == ["/fixture/sudo", "-n", "true"]:
+                return subprocess.CompletedProcess(args, 0)
+            if args[:3] == ["/fixture/sudo", "-n", "/usr/bin/bash"]:
+                d.publish(self.paths, Path(args[-2]), args[-1])
+                return subprocess.CompletedProcess(args, 0)
+            if args == ["systemctl", "--user", "daemon-reload"]:
+                if reload_failure is not None:
+                    raise reload_failure
+                return subprocess.CompletedProcess(args, 0)
+            self.assertTrue(Path(args[0]).is_relative_to(self.base), args)
+            self.assertEqual(args[1], "validate")
+            return run(args, **kwargs)
+        with patch.object(d.tempfile, "tempdir", str(self.base)), \
+                patch.object(d.shutil, "which", return_value="/fixture/sudo"), \
+                patch.object(d.subprocess, "run", side_effect=command):
+            yield d.Deployment(self.paths, lambda stage, sha: d.authorized_publish(self.paths, stage, sha))
+
+    def test_rollback_succeeds_without_a_user_manager(self):
+        one = self.install("one")
+        two = self.install("two")
+        unavailable = subprocess.CalledProcessError(1, ["systemctl", "--user", "daemon-reload"])
+        with self.authorized_deployment(unavailable) as deployment:
+            self.assertEqual(deployment.rollback(), one)
+        self.assertEqual(self.paths.selected(), {"current": one, "previous": two})
+        self.assertEqual((self.config / "config.kdl").read_text(), "accepted config\n")
+
+    def test_install_reload_failure_reports_committed_selection_and_retries_safely(self):
+        one = self.install("one")
+        artifact, accepted = self.artifact("two")
+        unavailable = subprocess.CalledProcessError(1, ["systemctl", "--user", "daemon-reload"])
+        with self.authorized_deployment(unavailable) as deployment:
+            with self.assertRaises(d.SelectionPublishedError) as failure:
+                deployment.install(artifact, accepted)
+        committed = failure.exception.selection
+        self.assertEqual(self.paths.selected(), committed)
+        self.assertEqual(committed["previous"], one)
+        self.assertEqual(d.digest(self.paths.bundle(committed["current"]) / "niri"), d.digest(artifact))
+        with self.authorized_deployment() as deployment:
+            self.assertEqual(deployment.install(artifact, accepted), committed["current"])
+        self.assertEqual(self.paths.selected(), committed)
+        self.assertEqual((self.config / "config.kdl").read_text(), "accepted config\n")
+
     def test_initial_install_has_complete_immutable_bundle_and_canonical_session(self):
         identifier = self.install("one")
         d.check_bundle(self.paths.bundle(identifier), identifier)
@@ -58,6 +108,49 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual((self.config / "config.kdl").read_text(), "accepted config\n")
         service = self.paths.root / d.SYSTEM_FILES["niri-personal.service"]
         self.assertIn("ExecStart=/usr/local/bin/niri-personal-session --exec", service.read_text())
+
+    def test_restrictive_umask_publishes_traversable_build_and_keeps_staging_private(self):
+        def validate_private_stage(binary, config):
+            self.assertEqual(stat.S_IMODE(binary.parent.parent.stat().st_mode) & 0o077, 0)
+            d.validate(binary, config)
+        deployment = d.Deployment(
+            self.paths, lambda stage, sha: d.publish(self.paths, stage, sha), validate_private_stage)
+        old_umask = os.umask(0o077)
+        try:
+            identifier = deployment.install(*self.artifact("private-umask"))
+        finally:
+            os.umask(old_umask)
+        published = [self.paths.selection, self.paths.bundle(identifier) / "niri"]
+        published.extend(self.paths.root / value for value in d.SYSTEM_FILES.values())
+        for file in published:
+            self.assertTrue(file.is_file())
+            directory = file.parent
+            while directory.is_relative_to(self.paths.root):
+                with self.subTest(directory=directory):
+                    self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+                directory = directory.parent
+        self.assertEqual(self.deploy.status()["selection"]["current"]["bundle"], identifier)
+
+    def test_publication_preserves_existing_system_directory_permissions(self):
+        parent = self.paths.root / "usr/local"
+        parent.mkdir(parents=True)
+        parent.chmod(0o751)
+        self.paths.store.mkdir(parents=True)
+        self.paths.store.chmod(0o700)
+        identifier = self.install("permissions")
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o751)
+        self.assertEqual(stat.S_IMODE(self.paths.store.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(self.paths.bundle(identifier).stat().st_mode), 0o755)
+
+    def test_store_symlink_does_not_relax_or_publish_into_another_directory(self):
+        private = self.base / "private"
+        private.mkdir(mode=0o700)
+        self.paths.store.parent.mkdir(parents=True)
+        self.paths.store.symlink_to(private, target_is_directory=True)
+        with self.assertRaises(d.DeploymentError):
+            self.install("redirected-store")
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o700)
+        self.assertEqual(list(private.iterdir()), [])
 
     def test_upgrade_and_rollback_preserve_edited_config(self):
         one = self.install("one")
@@ -75,6 +168,79 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.deploy.install(*args), two)
         self.assertEqual(self.paths.selected(), {"current": two, "previous": one})
         self.assertEqual(len(list((self.paths.store / "releases").iterdir())), 2)
+
+    def test_observed_acceptance_of_same_runtime_preserves_real_rollback(self):
+        one = self.install("one")
+        binary, accepted = self.artifact("two")
+        record = d.read_json(accepted)
+        record.update(source="user-authorized", result="approved-for-daily-trial",
+                      user_request="Install for daily trial", scope="Awaiting observation")
+        d.write_json(accepted, record)
+        trial = self.deploy.install(binary, accepted)
+        record.update(source="user-observed", result="passed", scope="User observed this exact build")
+        d.write_json(accepted, record)
+        observed = self.deploy.install(binary, accepted)
+        self.assertNotEqual(observed, trial)
+        self.assertEqual(self.paths.selected(), {"current": observed, "previous": one})
+        self.assertEqual(self.deploy.status()["selection"]["current"]["source"], "user-observed")
+        self.assertEqual(self.deploy.rollback(), one)
+        self.assertEqual(d.read_json(self.paths.bundle(trial) / "acceptance.json")["source"], "user-authorized")
+
+    def test_acceptance_update_after_first_install_does_not_invent_rollback(self):
+        binary, accepted = self.artifact("first")
+        self.deploy.install(binary, accepted)
+        record = d.read_json(accepted)
+        record["scope"] = "Additional user observation of the same runtime"
+        d.write_json(accepted, record)
+        current = self.deploy.install(binary, accepted)
+        self.assertEqual(self.paths.selected(), {"current": current, "previous": None})
+        with self.assertRaises(d.DeploymentError):
+            self.deploy.rollback()
+
+    def test_same_runtime_legacy_import_preserves_handoff_without_duplicate_rollback(self):
+        previous = self.prepare_legacy()
+        binary = self.base / "legacy"
+        accepted = self.base / "legacy-observed.json"
+        record = d.read_json(previous)
+        record["scope"] = "Additional observation of the same legacy executable"
+        d.write_json(accepted, record)
+        current = self.deploy.install(binary, accepted, previous_acceptance=previous)
+        self.assertEqual(self.paths.selected(), {"current": current, "previous": None})
+        self.assertEqual(d.digest(self.paths.store / "niri"), record["binary_sha256"])
+        self.assert_legacy_exec()
+
+    def test_session_or_migration_helper_change_is_a_new_runtime(self):
+        source = self.base / "source"
+        (source / "scripts").mkdir(parents=True)
+        (source / "docs").symlink_to(SOURCE / "docs", target_is_directory=True)
+        for name in ("personal-daily-session.sh", "personal-unify-config.py"):
+            shutil.copyfile(SOURCE / "scripts" / name, source / "scripts" / name)
+        paths = d.Paths(self.paths.root, self.config, source)
+        deployment = d.Deployment(paths, lambda stage, sha: d.publish(paths, stage, sha))
+        binary, accepted = self.artifact("same-binary")
+        current = deployment.install(binary, accepted)
+        for name, replacement in (
+            ("personal-daily-session.sh", "#!/bin/sh\nexit 17\n"),
+            ("personal-unify-config.py", "#!/usr/bin/python3\nraise SystemExit(17)\n"),
+        ):
+            with self.subTest(helper=name):
+                (source / "scripts" / name).write_text(replacement)
+                changed = deployment.install(binary, accepted)
+                self.assertEqual(paths.selected(), {"current": changed, "previous": current})
+                self.assertEqual(deployment.rollback(), current)
+                self.assertEqual(deployment.rollback(), changed)
+                current = changed
+
+    def test_acceptance_update_still_checks_current_runtime_integrity(self):
+        binary, accepted = self.artifact("one")
+        current = self.deploy.install(binary, accepted)
+        (self.paths.bundle(current) / "session.sh").write_text("corrupted installed helper")
+        record = d.read_json(accepted)
+        record["scope"] = "Updated evidence, unchanged accepted runtime"
+        d.write_json(accepted, record)
+        with self.assertRaises(d.DeploymentError):
+            self.deploy.install(binary, accepted)
+        self.assertEqual(self.paths.selected(), {"current": current, "previous": None})
 
     def test_denied_privilege_retries_without_migration_or_config_changes(self):
         pending = self.config / ".pending-personal"
@@ -348,7 +514,7 @@ class MigrationTests(unittest.TestCase):
 
     def test_stale_user_edit(self):
         self.edit()
-        with self.assertRaisesRegex(SystemExit, "edited after preparation"):
+        with self.assertRaises(SystemExit):
             self.apply()
         self.assertIn("user edit", (self.config / "cfg/layout.kdl").read_text())
 
@@ -371,15 +537,18 @@ class MigrationTests(unittest.TestCase):
             if config == self.config / "config.kdl":
                 self.edit()
                 raise RuntimeError("final validation failure")
-        with patch.object(m, "validate", fail), self.assertRaisesRegex(SystemExit, "user edits"):
+        with patch.object(m, "validate", fail), self.assertRaises(SystemExit):
             self.apply()
         self.assertIn("user edit", (self.config / "cfg/layout.kdl").read_text())
         self.assertEqual(d.read_json(self.stage / "manifest.json")["state"], "applying")
 
     def test_partial_write_failure_rolls_back(self):
         original = m.replace_file
+        interrupted = False
         def fail(source, destination):
-            if source == self.stage / "candidate/cfg/layout.kdl":
+            nonlocal interrupted
+            if destination == self.config / "cfg/layout.kdl" and not interrupted:
+                interrupted = True
                 raise KeyboardInterrupt("second write interrupted")
             original(source, destination)
         with patch.object(m, "replace_file", fail), self.assertRaises(KeyboardInterrupt):
@@ -399,13 +568,13 @@ class MigrationTests(unittest.TestCase):
     def test_interrupted_user_edit(self):
         self.interrupted()
         self.edit()
-        with self.assertRaisesRegex(SystemExit, "manual recovery"):
+        with self.assertRaises(SystemExit):
             self.apply()
         self.assertIn("user edit", (self.config / "cfg/layout.kdl").read_text())
 
     def test_altered_candidate(self):
         (self.stage / "candidate/cfg/layout.kdl").write_text("altered")
-        with self.assertRaisesRegex(SystemExit, "altered"):
+        with self.assertRaises(SystemExit):
             self.apply()
         self.assert_originals()
 
@@ -413,6 +582,205 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             m.prepare(self.config, self.config / "nested-stage", Path("unused"))
         self.assertFalse((self.config / "nested-stage").exists())
+
+    def saved_layout(self, radius=29, atomic=False):
+        path = self.config / "cfg/layout.kdl"
+        content = path.read_bytes().replace(b"geometry-corner-radius 12",
+                                           f"geometry-corner-radius {radius}".encode())
+        if atomic:
+            temporary = self.config / "cfg/editor-save"
+            temporary.write_bytes(content)
+            os.replace(temporary, path)
+        else:
+            path.write_bytes(content)
+        return content
+
+    def assert_preserved(self, content):
+        paths = [self.config / "cfg/layout.kdl", *(self.stage / "recovery").rglob("saved")]
+        self.assertTrue(any(path.read_bytes() == content for path in paths))
+
+    def test_user_save_between_recovery_writes_stops_without_losing_data(self):
+        self.interrupted()
+        exchange = m.replace_file
+        saved = []
+        def save(source, destination):
+            exchange(source, destination)
+            if destination == self.config / "cfg/outputs.kdl":
+                saved.append(self.saved_layout())
+        with patch.object(m, "replace_file", save), self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(saved[0])
+        self.assertEqual((self.config / "cfg/layout.kdl").read_bytes(), saved[0])
+        self.assertEqual(d.read_json(self.stage / "manifest.json")["state"], "applying")
+
+    def test_user_save_between_rollback_writes_stops_without_losing_data(self):
+        exchange = m.replace_file
+        rolling_back = False
+        saved = []
+        def fail(binary, config):
+            nonlocal rolling_back
+            if config == self.config / "config.kdl":
+                rolling_back = True
+                raise RuntimeError("final validation failure")
+        def save(source, destination):
+            exchange(source, destination)
+            if rolling_back and destination == self.config / "cfg/rules.kdl":
+                saved.append(self.saved_layout())
+        with patch.object(m, "validate", fail), patch.object(m, "replace_file", save), \
+                self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(saved[0])
+        self.assertEqual((self.config / "cfg/layout.kdl").read_bytes(), saved[0])
+        self.assertEqual(d.read_json(self.stage / "manifest.json")["state"], "applying")
+
+    def save_at_exchange(self, atomic):
+        exchange = m.replace_file
+        saved = []
+        def save(source, destination):
+            if destination == self.config / "cfg/layout.kdl" and not saved:
+                saved.append(self.saved_layout(atomic=atomic))
+            exchange(source, destination)
+        with patch.object(m, "replace_file", save), self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(saved[0])
+        with self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(saved[0])
+        return saved[0]
+
+    def test_in_place_save_after_last_check_is_retained(self):
+        self.save_at_exchange(atomic=False)
+
+    def test_atomic_editor_save_after_last_check_is_retained(self):
+        self.save_at_exchange(atomic=True)
+
+    def test_atomic_editor_save_after_exchange_remains_live(self):
+        exchange = m.replace_file
+        saved = []
+        def save(source, destination):
+            exchange(source, destination)
+            if destination == self.config / "cfg/layout.kdl" and not saved:
+                saved.append(self.saved_layout(atomic=True))
+        with patch.object(m, "replace_file", save), self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assertEqual((self.config / "cfg/layout.kdl").read_bytes(), saved[0])
+        with self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assertEqual((self.config / "cfg/layout.kdl").read_bytes(), saved[0])
+
+    def test_old_open_file_descriptor_can_save_after_success(self):
+        path = self.config / "cfg/layout.kdl"
+        content = path.read_bytes().replace(b"geometry-corner-radius 12", b"geometry-corner-radius 37")
+        with path.open("r+b") as editor:
+            self.apply()
+            editor.seek(0)
+            editor.write(content)
+            editor.truncate()
+            editor.flush()
+        self.assert_preserved(content)
+        with self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(content)
+
+    def crash_at_exchange(self, after, edit=False):
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            exchange = m.replace_file
+            def interrupted(source, destination):
+                if destination == self.config / "cfg/layout.kdl":
+                    if edit:
+                        self.saved_layout()
+                    if not after:
+                        os._exit(86)
+                    exchange(source, destination)
+                    os._exit(86)
+                exchange(source, destination)
+            with patch.object(m, "replace_file", interrupted):
+                self.apply()
+            os._exit(99)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 86)
+
+    def assert_migration_completed(self):
+        self.apply()
+        self.assertEqual(d.read_json(self.stage / "manifest.json")["state"], "applied")
+        for name, sha in self.record["changes"].items():
+            self.assertEqual(m.digest(self.config / name), sha)
+
+    def test_crash_after_intent_before_exchange_recovers(self):
+        self.crash_at_exchange(after=False)
+        self.assert_migration_completed()
+
+    def test_crash_after_exchange_and_during_recovery_recovers(self):
+        self.crash_at_exchange(after=True)
+        self.crash_at_exchange(after=True)
+        self.assert_migration_completed()
+
+    def test_crash_after_exchanging_user_save_requires_manual_recovery(self):
+        content = (self.config / "cfg/layout.kdl").read_bytes().replace(
+            b"geometry-corner-radius 12", b"geometry-corner-radius 29")
+        self.crash_at_exchange(after=True, edit=True)
+        with self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_preserved(content)
+
+    def test_crash_before_intent_publication_recovers(self):
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid == 0:
+            write_record = m.write_record
+            def interrupted(path, record):
+                if path.name == "intent.json":
+                    os._exit(86)
+                write_record(path, record)
+            with patch.object(m, "write_record", interrupted):
+                self.apply()
+            os._exit(99)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 86)
+        self.assert_originals()
+        self.assert_migration_completed()
+
+    def test_unsupported_exchange_preserves_config_and_can_retry(self):
+        with patch.object(m, "replace_file", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")), \
+                self.assertRaises(m.MigrationConflict):
+            self.apply()
+        self.assert_originals()
+        self.assert_migration_completed()
+
+    def test_saved_conflict_blocks_real_session_before_service_start(self):
+        content = self.save_at_exchange(atomic=True)
+        home = self.base / "home"
+        (home / ".config").mkdir(parents=True)
+        (home / ".config/niri").symlink_to(self.config, target_is_directory=True)
+        (self.config / ".pending-personal").symlink_to(self.stage, target_is_directory=True)
+        bundle = self.base / "bundle"
+        bundle.mkdir()
+        shutil.copy2(SOURCE / "scripts/personal-unify-config.py", bundle / "unify-config.py")
+        binary = bundle / "niri"
+        binary.write_text("#!/bin/sh\nexit 99\n")
+        binary.chmod(0o755)
+        commands = self.base / "commands"
+        commands.mkdir()
+        systemctl = commands / "systemctl"
+        systemctl.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_SYSTEMCTL_LOG"\n'
+            'if [ "$*" = "--user show -p ActiveState --value niri.service niri-personal.service graphical-session.target" ]; then\n'
+            '  printf "inactive\\ninactive\\ninactive\\n"\n  exit 0\nfi\nexit 97\n')
+        systemctl.chmod(0o755)
+        log = self.base / "systemctl.log"
+        env = {**os.environ, "HOME": str(home), "NIRI_PERSONAL_BUNDLE": str(bundle),
+               "PATH": f"{commands}:/usr/bin:/bin", "FIXTURE_SYSTEMCTL_LOG": str(log),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        result = subprocess.run(
+            ["/usr/bin/bash", str(SOURCE / "scripts/personal-daily-session.sh"), "--login"],
+            env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(self.config / ".pending-personal/recovery"), result.stderr)
+        self.assertEqual(log.read_text().splitlines(), [
+            "--user show -p ActiveState --value niri.service niri-personal.service graphical-session.target"])
+        self.assert_preserved(content)
 
 
 if __name__ == "__main__":

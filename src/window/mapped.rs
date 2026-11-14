@@ -453,12 +453,12 @@ impl Mapped {
 
         RenderSnapshot {
             contents,
-            contents_with_blocked_out_bg: None,
+            capture_textures: Default::default(),
+            background: Default::default(),
             blocked_out_contents,
             block_out_from: self.rules().block_out_from,
             size,
             texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
             blocked_out_texture: Default::default(),
         }
     }
@@ -665,6 +665,24 @@ impl LayoutElement for Mapped {
 
     fn update_config(&mut self, blur_config: niri_config::Blur) {
         self.blur_config = blur_config;
+    }
+
+    fn update_tab_title(&self, title: &mut String) {
+        with_toplevel_role(self.toplevel(), |role| {
+            let new_title = role
+                .title
+                .as_ref()
+                .filter(|title| !title.is_empty())
+                .or_else(|| role.app_id.as_ref().filter(|app_id| !app_id.is_empty()));
+            if let Some(new_title) = new_title {
+                if title != new_title {
+                    new_title.clone_into(title);
+                }
+            } else if title != "Untitled" {
+                title.clear();
+                title.push_str("Untitled");
+            }
+        });
     }
 
     fn size(&self) -> Size<i32, Logical> {

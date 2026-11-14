@@ -501,7 +501,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap_or(self.options.layout.default_column_display);
         let will_tab = display_mode == ColumnDisplay::Tabbed;
         let extra_size = if will_tab {
-            TabIndicator::new(self.options.layout.tab_indicator).extra_size(1, self.scale)
+            TabIndicator::new(self.options.layout.tab_indicator, self.options.layout.gaps)
+                .extra_size(1, self.scale)
         } else {
             Size::from((0., 0.))
         };
@@ -527,7 +528,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .unwrap_or(self.options.layout.default_column_display);
         let will_tab = display_mode == ColumnDisplay::Tabbed;
         let extra = if will_tab {
-            TabIndicator::new(self.options.layout.tab_indicator).extra_size(1, self.scale)
+            TabIndicator::new(self.options.layout.tab_indicator, self.options.layout.gaps)
+                .extra_size(1, self.scale)
         } else {
             Size::from((0., 0.))
         };
@@ -834,9 +836,73 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
+    pub(super) fn set_tab_drag_hover(
+        &mut self,
+        dragging: bool,
+        point: Option<Point<f64, Logical>>,
+    ) -> bool {
+        let target = point.and_then(|point| {
+            self.columns_with_render_positions().find_map(|(col, pos)| {
+                if col.display_mode != ColumnDisplay::Tabbed || !col.sizing_mode().is_normal() {
+                    return None;
+                }
+                let pos = pos.to_physical_precise_round(self.scale).to_logical(self.scale);
+                col.tab_indicator
+                    .drag_hover_hit(col.tab_indicator_area(), col.tiles.len(), self.scale, point - pos)
+                    .then_some(col.id)
+            })
+        });
+        let mut changed = false;
+        for col in &mut self.columns {
+            if dragging {
+                changed |= col.tab_indicator.set_hovered(None);
+            }
+            let eligible = dragging
+                && col.display_mode == ColumnDisplay::Tabbed
+                && col.sizing_mode().is_normal();
+            changed |= col.tab_indicator.set_drag_hover(eligible, eligible && target == Some(col.id));
+        }
+        changed
+    }
+
+    /// Resolves a tab-bar drop before considering ordinary tile/column gaps.
+    pub(super) fn tab_insert_position(&self, pos: Point<f64, Logical>) -> Option<InsertPosition> {
+        self.columns_with_render_positions().find_map(|(col, col_pos)| {
+            if col.display_mode != ColumnDisplay::Tabbed || !col.sizing_mode().is_normal() {
+                return None;
+            }
+            let col_pos = col_pos
+                .to_physical_precise_round(self.scale)
+                .to_logical(self.scale);
+            let index = col.tab_indicator.insertion_index(
+                col.tab_indicator_area(),
+                col.tiles.len(),
+                self.scale,
+                pos - col_pos,
+            )?;
+            let col_idx = self.columns.iter().position(|candidate| candidate.id == col.id)?;
+            Some(InsertPosition::InColumn(col_idx, index))
+        })
+    }
+
+    pub(super) fn tab_drag_insert_position(&self, pos: Point<f64, Logical>) -> InsertPosition {
+        self.tab_insert_position(pos).unwrap_or_else(|| {
+            let x = pos.x + self.view_pos() + self.options.layout.gaps / 2.;
+            let index = self.column_xs(self.data.iter().copied())
+                .enumerate()
+                .min_by_key(|(_, col_x)| NotNan::new((col_x - x).abs()).unwrap())
+                .map_or(0, |(index, _)| index);
+            InsertPosition::NewColumn(index)
+        })
+    }
+
     pub(super) fn insert_position(&self, pos: Point<f64, Logical>) -> InsertPosition {
         if self.columns.is_empty() {
             return InsertPosition::NewColumn(0);
+        }
+
+        if let Some(position) = self.tab_insert_position(pos) {
+            return position;
         }
 
         let x = pos.x + self.view_pos();
@@ -2522,7 +2588,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 }
             }
             InsertPosition::InColumn(column_index, tile_index) => {
-                if column_index > self.columns.len() {
+                if column_index >= self.columns.len() {
                     error!("insert hint column index is out of range");
                     return None;
                 }
@@ -2534,6 +2600,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 }
 
                 let is_tabbed = col.display_mode == ColumnDisplay::Tabbed;
+                if is_tabbed && col.sizing_mode().is_normal() {
+                    if let Some(mut marker) = col.tab_indicator.insertion_hint(
+                        col.tab_indicator_area(),
+                        col.tiles.len(),
+                        col.scale,
+                        tile_index,
+                    ) {
+                        marker.loc += Point::from((self.column_x(column_index) - self.view_pos(), 0.))
+                            + col.render_offset();
+                        return Some(marker);
+                    }
+                }
 
                 let (height, y) = if is_tabbed {
                     // In tabbed mode, there's only one tile visible, and we want to draw the hint
@@ -2993,6 +3071,28 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         Some(col.tiles[col.active_tile_idx].window())
     }
 
+    pub(super) fn has_tab_insert_hint(&self, position: InsertPosition) -> bool {
+        let InsertPosition::InColumn(column, index) = position else {
+            return false;
+        };
+        self.columns.get(column).is_some_and(|col| {
+            index <= col.tiles.len() && col.tab_indicator.is_drag_destination()
+        })
+    }
+
+    pub fn render_tab_drop_targets<R: NiriRenderer>(
+        &self,
+        ctx: RenderCtx<R>,
+        push: &mut dyn FnMut(TabIndicatorRenderElement),
+    ) {
+        for (col, pos) in self.columns_with_render_positions() {
+            if col.tab_indicator.is_drag_overlay() {
+                let pos = pos.to_physical_precise_round(self.scale).to_logical(self.scale);
+                col.tab_indicator.render(ctx.renderer, pos, ctx.target, push);
+            }
+        }
+    }
+
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
@@ -3012,8 +3112,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if layer.is_normal() {
             let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.r(), view_rect, scale);
-                push(elem.into());
+                if let Some(elem) = closing.render(ctx.r(), view_rect, scale) {
+                    push(elem.into());
+                }
             }
         }
 
@@ -3031,11 +3132,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 continue;
             }
 
-            // Draw the tab indicator on top.
-            {
-                let pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
+            let pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
+            col.tab_indicator.render_tooltip(
+                ctx.renderer, pos, ctx.target, &mut |elem| push(elem.into()),
+            );
+            // Preserve the legacy compact indicator's stacking.
+            if !col.tab_indicator.config().show_title {
                 col.tab_indicator
-                    .render(ctx.renderer, pos, &mut |elem| push(elem.into()));
+                    .render(ctx.renderer, pos, ctx.target, &mut |elem| push(elem.into()));
             }
 
             for (tile, tile_off, visible) in col.tiles_in_render_order() {
@@ -3065,14 +3169,54 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 });
             }
         }
+        // Rail markers sit behind client surfaces, including popups crossing the gutter.
+        // The read-only tooltip above never participates in input hit testing.
+        for (col, col_pos) in self.columns_with_render_positions() {
+            if col.tab_indicator.config().show_title
+                && !col.tab_indicator.is_drag_overlay()
+                && layer.is_normal() != col.is_moving_between_workspaces()
+            {
+                let pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
+                col.tab_indicator
+                    .render(ctx.renderer, pos, ctx.target, &mut |elem| push(elem.into()));
+            }
+        }
+    }
+
+    pub(super) fn set_tab_hover(&mut self, window: Option<&W::Id>) -> bool {
+        let mut changed = false;
+        for col in &mut self.columns {
+            let hovered = window.and_then(|id| {
+                (col.display_mode == ColumnDisplay::Tabbed && col.sizing_mode().is_normal())
+                    .then(|| col.tiles.iter().position(|tile| tile.window().id() == id))
+                    .flatten()
+            });
+            changed |= col.tab_indicator.set_hovered(hovered);
+        }
+        changed
+    }
+
+    pub(super) fn tab_scroll_target(&self, window: &W::Id, steps: i32) -> Option<W::Id> {
+        let col = self.columns.iter().find(|col| {
+            col.display_mode == ColumnDisplay::Tabbed
+                && col.sizing_mode().is_normal()
+                && col.tiles.iter().any(|tile| tile.window().id() == window)
+        })?;
+        let index = col.active_tile_idx.saturating_add_signed(steps as isize)
+            .min(col.tiles.len() - 1);
+        (index != col.active_tile_idx).then(|| col.tiles[index].window().id().clone())
     }
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
         // This matches self.tiles_with_render_positions().
         let scale = self.scale;
         for (col, col_pos) in self.columns_with_render_positions() {
-            // Hit the tab indicator.
-            if col.display_mode == ColumnDisplay::Tabbed && col.sizing_mode().is_normal() {
+            // Keep compact mode's legacy priority. Interactive rails are checked only
+            // after every client tile, so application popups over a gutter win.
+            if !col.tab_indicator.config().show_title
+                && col.display_mode == ColumnDisplay::Tabbed
+                && col.sizing_mode().is_normal()
+            {
                 let col_pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
 
                 if let Some(idx) = col.tab_indicator.hit(
@@ -3081,10 +3225,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     scale,
                     pos - col_pos,
                 ) {
-                    let hit = HitType::Activate {
-                        is_tab_indicator: true,
-                    };
-                    return Some((col.tiles[idx].window(), hit));
+                    return Some((col.tiles[idx].window(), HitType::TabIndicator));
                 }
             }
 
@@ -3103,7 +3244,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             }
         }
 
-        None
+        self.columns_with_render_positions().find_map(|(col, col_pos)| {
+            if !col.tab_indicator.config().show_title
+                || col.display_mode != ColumnDisplay::Tabbed
+                || !col.sizing_mode().is_normal()
+            {
+                return None;
+            }
+            let col_pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
+            let idx = col.tab_indicator.hit(
+                col.tab_indicator_area(), col.tiles.len(), scale, pos - col_pos,
+            )?;
+            Some((col.tiles[idx].window(), HitType::Tab))
+        })
     }
 
     pub fn view_offset_gesture_begin(&mut self, is_touchpad: bool) {
@@ -3196,8 +3349,14 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let now = self.clock.now_unadjusted();
         gesture.dnd_last_event_time = Some(now);
 
-        if delta == 0. {
-            // We're outside the scrolling zone.
+        if delta == 0.
+            || self
+                .columns
+                .iter()
+                .any(|col| col.tab_indicator.is_drag_destination())
+        {
+            // A rail is a precise drop target: do not scroll it away from the pointer.
+            // Reset the edge delay so leaving the rail resumes normal edge scrolling.
             gesture.dnd_nonzero_start_time = None;
             return false;
         }
@@ -4066,7 +4225,7 @@ impl<W: LayoutElement> Column<W> {
             is_pending_maximized: false,
             is_pending_fullscreen: false,
             display_mode,
-            tab_indicator: TabIndicator::new(options.layout.tab_indicator),
+            tab_indicator: TabIndicator::new(options.layout.tab_indicator, options.layout.gaps),
             move_x_animation: None,
             move_y_animation: None,
             view_size,
@@ -4154,7 +4313,7 @@ impl<W: LayoutElement> Column<W> {
         }
 
         self.tab_indicator
-            .update_config(options.layout.tab_indicator);
+            .update_config(options.layout.tab_indicator, options.layout.gaps);
         self.view_size = view_size;
         self.working_area = working_area;
         self.parent_area = parent_area;

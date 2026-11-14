@@ -38,6 +38,30 @@ pin into systemd. The first upgrade from a flat installation retains a hash-pinn
 flat executable/wrapper so an already executing old login can finish its handoff.
 This transition does not select a later bundle implicitly.
 
+## Application spawning
+
+`spawn` and `spawn-sh` start a private mode of the same executable before creating
+the application. On Linux, `/proc/self/exe` pins this helper to the running image,
+including after replacement or unlinking. The compositor-side `Command` has no
+`pre_exec` hook, allowing Rust's supported libc path to use `posix_spawn` without
+forking the compositor's large address space or invoking allocator fork handlers.
+
+The helper receives byte-preserving arguments and ordered environment overrides
+through stdin JSON, not its command line. Application-specific environment changes
+are applied only after helper startup, so configured loader variables do not affect
+the helper. The helper unblocks signals; the application alone restores the original
+nofile limit. Existing environment precedence, activation tokens, null standard
+streams and shell semantics are retained.
+
+The helper stays alive until the application's systemd scope job completes, with
+both PIDs included so a fast-exiting application cannot leave the new scope empty.
+It then exits without waiting for the application; the compositor reaps the helper.
+Failed exec returns an error without a second-fork pipe handshake. Do not move
+application `pre_exec` work back into the compositor-side launch path.
+
+This isolates application launch costs; it does not diagnose compositor heap growth
+or change the separate Xwayland startup path.
+
 ## Glass
 
 `GlassRequest` rejects `off` and explicit non-xray settings before visibility is
@@ -83,6 +107,64 @@ independently of the window's own capture target. The route is restored on scope
 including errors and unwinding. Tile no longer swaps buffer pointers, and emitted
 elements retain the selected buffer after routing is restored. Capture-blocked layers
 must remain blocked when sampled through effects and closing animations.
+
+Snapshot background dependencies retain each sampled layer's per-target protection
+generation, including layers that were unprotected at snapshot creation. The policy
+record and last resolved protection belong to the original layer-shell object's
+`LayerSurface` user data, not a `MappedLayer`; null-buffer unmap/remap reuses them.
+Rule recomputation covers both mapped and unmapped objects on reload/startup and
+relevant commits, revoking only targets whose protection tightens. Both pending
+unmap and active closing snapshots check those generations before capture. A revoked
+snapshot stays omitted for that target; removing protection does not revive it.
+Unmap alone does not revoke a snapshot. Output keeps its original closing animation.
+These dependencies retain only generation state, not the source surface, renderer
+or GPU textures. Destroying an object ends its policy updates; a new object is unrelated.
+
+Snapshot baking distinguishes Output, ScreenCapture and Screencast. Without an active
+resize snapshot, variants with the same window visibility and background target share
+GPU texture handles: no protection needs only the normal texture, while distinct
+capture policies add up to two textures. An active resize still samples older contents
+with independent target policy, so each target is baked separately rather than
+assuming equivalence from current rules. This remains at most three textures, only
+when creating a closing snapshot. A required failed bake stays unavailable instead
+of falling back to normal contents. Dependencies cost one small generation record
+and last-policy value per layer-shell object, plus a list of sampled sources per
+snapshot. Capture checks that list without allocation or rerendering. Dependency
+tracking is conservative across the source output's background layers rather than
+per-pixel: tightening a recorded layer can omit a closing snapshot even if that
+layer contributed no visible pixels to it.
+
+`tests/capture_privacy.rs` exercises real scene pixels through both capture targets
+and Output, including an earlier subsurface-destruction snapshot, null-buffer and
+toplevel destruction, same-object layer unmap/remap, protection tightening while
+unmapped (reload, startup and commit), protection removal, mixed policies and closing
+during resize after window protection tightens.
+
+While a window remains mapped, rule recomputation also restricts its existing
+resize-from and pending-unmap samples through `Tile::update_window`. The snapshot's
+own window protection is monotonic: tightening happens at the rule update, even
+if no capture occurs before a later loosening. Resize samples select their existing
+black replacement; a newly forbidden prebaked tile target becomes explicitly
+unavailable, never falling back to its Output texture. Protected resize failures
+use a black capture fallback rather than the normal red diagnostic fallback.
+Output animation inputs and timing remain unchanged.
+`Layout::update_window` also forwards to tiles in the minimized pool: they remain
+mapped even though they have no current output/workspace membership. On an actual
+commit, `on_commit(serial)` runs before the tile update, as for interactive moves;
+a rules-only update has no serial and does not advance committed sizing state.
+This updates the retained tile without restoring it or creating an output binding.
+Waiting until restore would lose a tightening followed by loosening while hidden.
+
+This reuses `RenderSnapshot`'s protection and target slots: no second policy record,
+new per-frame allocation, or unconditional extra full-size texture. Loosening may
+show current live content but cannot revive a restricted old sample. Once the
+window leaves mapped state, future window-rule changes do not retroactively
+associate it with closing snapshots. Deterministic two-color tests cover live
+resize at start/midpoint/completion, tighten-then-loosen without intervening capture,
+pending consumption, pre-protected/no-pending controls, and Output preservation.
+The same rules are exercised while minimized, including pending created during
+resize and a tighten-before-minimize ordering control.
+
 
 ## SDR capture operation
 

@@ -62,7 +62,7 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{RenderSnapshot, SnapshotBackground};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -136,6 +136,11 @@ pub trait LayoutElement {
 
     /// Unique ID of this element.
     fn id(&self) -> &Self::Id;
+
+    /// Updates the cached tab label without allocating when the title is unchanged.
+    fn update_tab_title(&self, title: &mut String) {
+        title.clear();
+    }
 
     /// Updates the config for the element.
     fn update_config(&mut self, blur_config: niri_config::Blur) {
@@ -433,6 +438,8 @@ enum InteractiveMoveState<W: LayoutElement> {
         ///
         /// This helps the pointer remain inside the window as it resizes.
         pointer_ratio_within_window: (f64, f64),
+        /// Tab drags only merge when dropped onto a tab bar.
+        from_tab: bool,
     },
     /// Moving; the window is no longer in the layout.
     Moving(InteractiveMoveData<W>),
@@ -452,6 +459,7 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) is_full_width: bool,
     /// Whether the window targets the floating layout.
     pub(self) is_floating: bool,
+    from_tab: bool,
     /// Pointer location within the visual window geometry as ratio from geometry size.
     ///
     /// This helps the pointer remain inside the window as it resizes.
@@ -575,10 +583,11 @@ pub enum HitType {
     /// The hit can activate a window, but it is not in the input region so cannot send events.
     ///
     /// For example, this could be clicking on a tile border outside the window.
-    Activate {
-        /// Whether the hit was on the tab indicator.
-        is_tab_indicator: bool,
-    },
+    Activate,
+    /// A compact indicator: activate on click, but do not enable title-bar gestures.
+    TabIndicator,
+    /// A compositor-owned interactive tab rail outside the window.
+    Tab,
 }
 
 #[derive(Debug)]
@@ -668,7 +677,7 @@ impl HitType {
     pub fn offset_win_pos(mut self, offset: Point<f64, Logical>) -> Self {
         match &mut self {
             HitType::Input { win_pos } => *win_pos += offset,
-            HitType::Activate { .. } => (),
+            HitType::Activate | HitType::TabIndicator | HitType::Tab => (),
         }
         self
     }
@@ -685,10 +694,8 @@ impl HitType {
 
     pub fn to_activate(self) -> Self {
         match self {
-            HitType::Input { .. } => HitType::Activate {
-                is_tab_indicator: false,
-            },
-            HitType::Activate { .. } => self,
+            HitType::Input { .. } => HitType::Activate,
+            HitType::Activate | HitType::TabIndicator | HitType::Tab => self,
         }
     }
 }
@@ -1230,6 +1237,7 @@ impl<W: LayoutElement> Layout<W> {
                         for ws in self.workspaces_mut() {
                             ws.dnd_scroll_gesture_end();
                         }
+                        self.update_tab_drag_hover();
 
                         return Some(RemovedTile {
                             tile: move_.tile,
@@ -1466,6 +1474,18 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 move_.tile.update_window();
+                return;
+            }
+        }
+
+        for min in &mut self.minimized {
+            if min.tile.window().id() == window {
+                // Hidden windows remain mapped: apply rules now, not only on restore.
+                // As with interactive moves, commit sizing state before updating the tile.
+                if let Some(serial) = serial {
+                    min.tile.window_mut().on_commit(serial);
+                }
+                min.tile.update_window();
                 return;
             }
         }
@@ -1794,6 +1814,27 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         ws_idx == mon.active_workspace_idx
+    }
+
+    /// Updates tab hover feedback without activating the window.
+    pub fn set_tab_hover(&mut self, window: Option<&W::Id>) -> bool {
+        let mut changed = false;
+        for ws in self.workspaces_mut() {
+            changed |= ws.scrolling_mut().set_tab_hover(window);
+        }
+        changed
+    }
+
+    /// Switches relative to the active tab of the hovered column, without wrapping.
+    pub fn scroll_tab(&mut self, window: &W::Id, steps: i32) -> bool {
+        let target = self
+            .workspaces()
+            .find_map(|(_, _, ws)| ws.scrolling().tab_scroll_target(window, steps));
+        let Some(target) = target else {
+            return false;
+        };
+        self.activate_window(&target);
+        true
     }
 
     pub fn activate_window(&mut self, window: &W::Id) {
@@ -2736,6 +2777,7 @@ impl<W: LayoutElement> Layout<W> {
                     window_id,
                     pointer_delta: _,
                     pointer_ratio_within_window: _,
+                    from_tab: _,
                 } => {
                     assert!(
                         self.has_window(window_id),
@@ -3127,6 +3169,7 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        self.update_tab_drag_hover();
         self.update_insert_hint(output);
 
         let MonitorSet::Normal {
@@ -3171,6 +3214,29 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    fn update_tab_drag_hover(&mut self) {
+        let move_ = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) if !move_.is_floating => Some(move_),
+            _ => None,
+        };
+        let dragging = move_.is_some();
+        let target = move_.and_then(|move_| {
+            let mon = self.monitor_for_output(&move_.output)?;
+            let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+            let InsertWorkspace::Existing(id) = insert_ws else {
+                return None;
+            };
+            Some((
+                id,
+                (move_.pointer_pos_within_output - geo.loc).downscale(mon.overview_zoom()),
+            ))
+        });
+        for ws in self.workspaces_mut() {
+            let point = target.and_then(|(id, point)| (ws.id() == id).then_some(point));
+            ws.scrolling_mut().set_tab_drag_hover(dragging, point);
+        }
+    }
+
     fn update_insert_hint(&mut self, output: Option<&Output>) {
         let _span = tracy_client::span!("Layout::update_insert_hint");
 
@@ -3202,6 +3268,8 @@ impl<W: LayoutElement> Layout<W> {
                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                     let position = if move_.is_floating {
                         InsertPosition::Floating
+                    } else if move_.from_tab {
+                        ws.scrolling().tab_drag_insert_position(pos_within_workspace)
                     } else {
                         ws.scrolling_insert_position(pos_within_workspace)
                     };
@@ -4135,6 +4203,7 @@ impl<W: LayoutElement> Layout<W> {
         window_id: W::Id,
         output: &Output,
         start_pos_within_output: Point<f64, Logical>,
+        from_tab: bool,
     ) -> bool {
         if self.interactive_move.is_some() {
             return false;
@@ -4175,6 +4244,7 @@ impl<W: LayoutElement> Layout<W> {
             window_id,
             pointer_delta: Point::from((0., 0.)),
             pointer_ratio_within_window,
+            from_tab,
         });
 
         for mon in self.monitors_mut() {
@@ -4207,12 +4277,14 @@ impl<W: LayoutElement> Layout<W> {
                 window_id,
                 mut pointer_delta,
                 pointer_ratio_within_window,
+                from_tab,
             } => {
                 if window_id != *window {
                     self.interactive_move = Some(InteractiveMoveState::Starting {
                         window_id,
                         pointer_delta,
                         pointer_ratio_within_window,
+                        from_tab,
                     });
                     return false;
                 }
@@ -4252,9 +4324,10 @@ impl<W: LayoutElement> Layout<W> {
                     window_id: window_id.clone(),
                     pointer_delta,
                     pointer_ratio_within_window,
+                    from_tab,
                 });
 
-                if !is_floating && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
+                if !is_floating && !from_tab && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
                     return true;
                 }
 
@@ -4346,6 +4419,7 @@ impl<W: LayoutElement> Layout<W> {
                     width,
                     is_full_width,
                     is_floating,
+                    from_tab,
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
@@ -4415,6 +4489,7 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        self.update_tab_drag_hover();
         true
     }
 
@@ -4468,6 +4543,9 @@ impl<W: LayoutElement> Layout<W> {
             return;
         }
 
+        // Recompute against current geometry even if release preceded the next render frame.
+        self.update_tab_drag_hover();
+
         let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
             unreachable!()
         };
@@ -4514,7 +4592,11 @@ impl<W: LayoutElement> Layout<W> {
                                     let pos_within_workspace =
                                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                                     let ws = &mut mon.workspaces[ws_idx];
-                                    ws.scrolling_insert_position(pos_within_workspace)
+                                    if move_.from_tab {
+                                        ws.scrolling().tab_drag_insert_position(pos_within_workspace)
+                                    } else {
+                                        ws.scrolling_insert_position(pos_within_workspace)
+                                    }
                                 };
 
                                 (position, Some(geo.loc))
@@ -4540,6 +4622,8 @@ impl<W: LayoutElement> Layout<W> {
 
                         let position = if move_.is_floating {
                             InsertPosition::Floating
+                        } else if move_.from_tab {
+                            InsertPosition::NewColumn(0)
                         } else {
                             ws.scrolling_insert_position(Point::from((0., 0.)))
                         };
@@ -4682,6 +4766,11 @@ impl<W: LayoutElement> Layout<W> {
                 );
             }
         }
+        self.update_tab_drag_hover();
+    }
+
+    pub fn interactive_move_is_scrolling(&self) -> bool {
+        matches!(&self.interactive_move, Some(InteractiveMoveState::Moving(move_)) if !move_.is_floating)
     }
 
     pub fn interactive_move_is_moving_above_output(&self, output: &Output) -> bool {
@@ -4994,7 +5083,7 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         renderer: &mut R,
         xray: Option<&Xray>,
-        xray_has_blocked_out_layers: bool,
+        background: SnapshotBackground,
         window: &W::Id,
     ) where
         LayoutElementRenderElement<R>: RenderElement<R>,
@@ -5019,7 +5108,7 @@ impl<W: LayoutElement> Layout<W> {
                 move_.tile.store_unmap_snapshot_if_empty(
                     renderer,
                     xray,
-                    xray_has_blocked_out_layers,
+                    background,
                     XrayPos::new(pos_within_output, zoom),
                 );
                 return;
@@ -5034,7 +5123,7 @@ impl<W: LayoutElement> Layout<W> {
                             ws.store_unmap_snapshot_if_empty(
                                 renderer,
                                 xray,
-                                xray_has_blocked_out_layers,
+                                background,
                                 XrayPos::new(geo.loc, zoom),
                                 window,
                             );
@@ -5049,7 +5138,7 @@ impl<W: LayoutElement> Layout<W> {
                         ws.store_unmap_snapshot_if_empty(
                             renderer,
                             xray,
-                            xray_has_blocked_out_layers,
+                            background,
                             XrayPos::default(),
                             window,
                         );

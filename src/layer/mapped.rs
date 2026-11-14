@@ -14,6 +14,7 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
+use crate::render_helpers::snapshot::BackgroundCapturePolicy;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::xray::XrayPos;
@@ -163,6 +164,8 @@ impl MappedLayer {
         shadow_config.on = false;
         shadow_config.merge_with(&rules.shadow);
 
+        BackgroundCapturePolicy::for_layer(&surface).update(rules.block_out_from);
+
         Self {
             surface,
             pre_commit_hook,
@@ -229,6 +232,7 @@ impl MappedLayer {
             return false;
         }
 
+        BackgroundCapturePolicy::for_layer(&self.surface).update(new_rules.block_out_from);
         self.rules = new_rules;
         true
     }

@@ -14,7 +14,8 @@ import subprocess
 import tempfile
 
 
-FILES = ("niri", "session.sh", "unify-config.py", "acceptance.json")
+RUNTIME_FILES = ("niri", "session.sh", "unify-config.py")
+FILES = (*RUNTIME_FILES, "acceptance.json")
 SYSTEM_FILES = {
     "niri-personal-launch.py": "usr/local/bin/niri-personal-session",
     "niri-personal.service": "usr/local/lib/systemd/user/niri-personal.service",
@@ -25,6 +26,18 @@ SYSTEM_FILES = {
 
 class DeploymentError(Exception):
     pass
+
+
+class SelectionPublishedError(DeploymentError):
+    """Publication committed; only the user-manager metadata reload failed."""
+
+    def __init__(self, selection, cause):
+        self.selection = selection
+        super().__init__(
+            f"Build {selection['current']} has already been selected for the next login "
+            f"(rollback: {selection['previous']}); user-unit metadata reload failed: {cause}. "
+            "Retry the same install command with unchanged artifact and acceptance files; "
+            "do not use rollback to retry the reload. The running desktop is unchanged.")
 
 
 def digest(path):
@@ -132,6 +145,12 @@ def check_bundle(directory, identifier):
         if path.is_symlink() or not path.is_file() or digest(path) != sha:
             raise DeploymentError(f"Build content changed: {name}")
     acceptance(directory / "acceptance.json", directory / "niri")
+    return manifest
+
+
+def same_runtime(left, right):
+    # Callers supply fully verified manifests, not unchecked metadata.
+    return all(left["files"][name] == right["files"][name] for name in RUNTIME_FILES)
 
 
 class Deployment:
@@ -171,20 +190,23 @@ class Deployment:
             stage = Path(temporary)
             identifier = make_bundle(stage / "candidate", artifact, accepted_record, self.paths.source)
             self.validate(stage / "candidate/niri", config)
-            check_bundle(stage / "candidate", identifier)
+            candidate_manifest = check_bundle(stage / "candidate", identifier)
             bundles = {identifier: "candidate"}
             previous = current["current"] if current else None
-            if current and previous == identifier:
-                previous = current.get("previous")
+            if current:
+                installed_manifest = check_bundle(self.paths.bundle(previous), previous)
+                if same_runtime(candidate_manifest, installed_manifest):
+                    previous = current.get("previous")
             legacy_sha = None
             if not current and (self.paths.store / "niri").is_file():
                 old_binary = self.paths.store / "niri"
                 old = make_bundle(stage / "legacy", old_binary, previous_record, self.paths.source)
                 self.validate(stage / "legacy/niri", config)
-                check_bundle(stage / "legacy", old)
+                legacy_manifest = check_bundle(stage / "legacy", old)
                 legacy_sha = previous_record["binary_sha256"]
                 if old != identifier:
                     bundles[old] = "legacy"
+                if not same_runtime(candidate_manifest, legacy_manifest):
                     previous = old
             for name in SYSTEM_FILES:
                 shutil.copyfile(self.paths.source / "docs/personal/deployment" / name, stage / name)
@@ -212,16 +234,32 @@ class Deployment:
         return target
 
 
+def published_directory(path, *, owned=False):
+    """Set permissions only on new directories or this deployment's own directories."""
+    try:
+        path.mkdir()
+    except FileNotFoundError:
+        published_directory(path.parent)
+        published_directory(path, owned=owned)
+        return
+    except FileExistsError:
+        if not path.is_dir() or (owned and path.is_symlink()):
+            raise DeploymentError(f"Invalid deployment directory: {path}")
+        if not owned:
+            return
+    path.chmod(0o755)
+
+
 @contextmanager
 def exclusive_store(store):
-    store.mkdir(parents=True, exist_ok=True)
+    published_directory(store, owned=True)
     with (store / ".deploy.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
 def atomic_copy(source, destination, mode):
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    published_directory(destination.parent)
     fd, temporary = tempfile.mkstemp(prefix=".niri-personal-install-", dir=destination.parent)
     os.close(fd)
     try:
@@ -232,14 +270,18 @@ def atomic_copy(source, destination, mode):
         Path(temporary).unlink(missing_ok=True)
 
 
+def verified_plan(stage, plan_sha):
+    plan_bytes = (stage / "plan.json").read_bytes()
+    if hashlib.sha256(plan_bytes).hexdigest() != plan_sha:
+        raise DeploymentError("Deployment plan changed during authentication; retry.")
+    return json.loads(plan_bytes)
+
+
 def publish(paths, stage, plan_sha):
     """Privileged adapter: fixed personal paths; never runs a supplied executable."""
     # Copy user-owned input before examining it. Every bundle and helper is checked
     # against its manifest after copying and before making a selection visible.
-    plan_bytes = (stage / "plan.json").read_bytes()
-    if hashlib.sha256(plan_bytes).hexdigest() != plan_sha:
-        raise DeploymentError("Deployment plan changed during authentication; retry.")
-    plan = json.loads(plan_bytes)
+    plan = verified_plan(stage, plan_sha)
     with exclusive_store(paths.store):
         if plan.get("schema") != 1 or paths.selected() != plan.get("expected"):
             raise DeploymentError("The selected build changed during preparation; retry from the current state.")
@@ -253,7 +295,7 @@ def publish(paths, stage, plan_sha):
         if system_files and set(system_files) != set(SYSTEM_FILES):
             raise DeploymentError("Incomplete personal session entry.")
         releases = paths.store / "releases"
-        releases.mkdir(exist_ok=True)
+        published_directory(releases, owned=True)
         # Recover only this adapter's abandoned copies, under its exclusive lock.
         for directory, pattern in ((releases, ".incoming-*"), (paths.store, ".entry-*")):
             for stale in directory.glob(pattern):
@@ -270,21 +312,24 @@ def publish(paths, stage, plan_sha):
                 raise DeploymentError("Invalid staged build path.")
             if destination.exists():
                 check_bundle(destination, identifier)
+                published_directory(destination, owned=True)
                 continue
             with tempfile.TemporaryDirectory(prefix=".incoming-", dir=releases) as temporary:
                 incoming = Path(temporary) / "bundle"
-                incoming.mkdir()
+                incoming.mkdir(mode=0o700)
                 for name in (*FILES, "manifest.json"):
                     original = stage / source / name
                     if original.is_symlink() or not original.is_file():
                         raise DeploymentError("Staged build must contain regular files.")
                     shutil.copyfile(original, incoming / name)
-                    (incoming / name).chmod(0o755 if name in FILES[:3] else 0o644)
+                    (incoming / name).chmod(0o755 if name in RUNTIME_FILES else 0o644)
                 check_bundle(incoming, identifier)
+                incoming.chmod(0o755)
                 os.rename(incoming, destination)
         for identifier in (selection["current"], selection["previous"]):
             if identifier:
                 check_bundle(paths.bundle(identifier), identifier)
+                published_directory(paths.bundle(identifier), owned=True)
         # Keep the previous flat session usable if first-time bootstrap is interrupted
         # before selection.json appears. Future deployments share these stable entry files.
         legacy = paths.root / "usr/local/bin/niri-personal-session"
@@ -313,6 +358,8 @@ def publish(paths, stage, plan_sha):
 
 
 def authorized_publish(paths, stage, plan_sha):
+    # Retain the exact plan that the privileged adapter independently verifies.
+    plan = verified_plan(stage, plan_sha)
     helper = paths.source / "scripts/personal-install-system.sh"
     sudo = shutil.which("sudo")
     if sudo and subprocess.run([sudo, "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
@@ -322,7 +369,11 @@ def authorized_publish(paths, stage, plan_sha):
     else:
         raise DeploymentError("Administrator authentication requires sudo or pkexec.")
     subprocess.run([*command, "/usr/bin/bash", str(helper), str(stage), plan_sha], check=True)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    if plan["system_files"]:
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise SelectionPublishedError(plan["selection"], error) from error
 
 
 def main():
@@ -357,5 +408,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except SelectionPublishedError as error:
+        raise SystemExit(str(error))
     except (DeploymentError, OSError, ValueError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"Daily deployment failed: {error}")

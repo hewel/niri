@@ -18,6 +18,7 @@ use smithay::backend::input::{
     TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
+use smithay::desktop::Window;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{
     keysyms, FilterResult, KeyboardSource, Keysym, Layout, ModifiersState,
@@ -51,7 +52,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::{ActivateWindow, HitType, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::minimized_strip;
 use crate::ui::mru::{WindowMru, WindowMruUi};
@@ -69,6 +70,7 @@ pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
+pub mod tab_scroll;
 pub mod touch_overview_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
@@ -685,6 +687,7 @@ impl State {
         }
 
         self.niri.pointer_visibility = PointerVisibility::Hidden;
+        self.niri.update_tab_hover();
         self.niri.queue_redraw_all();
     }
 
@@ -733,6 +736,7 @@ impl State {
         match action {
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
+                    self.niri.update_tab_hover();
                     self.niri.queue_redraw_all();
                     return;
                 }
@@ -2500,6 +2504,7 @@ impl State {
                             }
 
                             drop(config);
+                            self.niri.update_tab_hover();
                             self.niri.queue_redraw_all();
                         }
                     }
@@ -2761,6 +2766,8 @@ impl State {
 
         pointer.frame(self);
 
+        self.niri.update_tab_hover();
+
         // contents_under() will return no surface when the hot corner should trigger, so
         // pointer.motion() will set the current focus to None.
         if under.hot_corner && pointer.current_focus().is_none() {
@@ -2872,6 +2879,8 @@ impl State {
 
         // We moved the regular pointer, so show it now.
         self.niri.tablet_cursor_location = None;
+
+        self.niri.update_tab_hover();
 
         // Inform the layout of an ongoing DnD operation.
         let is_dnd_grab = pointer
@@ -3073,6 +3082,71 @@ impl State {
                 }
             }
 
+            let tab_under = if pointer.is_grabbed() {
+                None
+            } else {
+                self.niri
+                    .contents_under(pointer.current_location())
+                    .window
+                    .and_then(|(window, hit)| match hit {
+                        HitType::Tab => Some(window),
+                        HitType::Input { .. } | HitType::Activate | HitType::TabIndicator => None,
+                    })
+            };
+
+            if let Some(window) = tab_under {
+                if button == Some(MouseButton::Middle) {
+                    if let Some((_, mapped)) = self
+                        .niri
+                        .layout
+                        .windows()
+                        .find(|(_, mapped)| mapped.window == window)
+                    {
+                        mapped.toplevel().send_close();
+                    }
+
+                    self.niri.suppressed_buttons.insert(button_code);
+                    return;
+                }
+
+                if button == Some(MouseButton::Left) {
+                    self.niri.layout.activate_window(&window);
+                    self.niri.queue_redraw_all();
+
+                    let location = pointer.current_location();
+                    let start_data = PointerGrabStartData {
+                        focus: None,
+                        button: button_code,
+                        location,
+                    };
+                    let start_data = AnyStartData::Pointer(start_data);
+                    let icon = CursorIcon::Grabbing;
+                    let grab = MoveGrab::new(self, start_data, window, false, Some(icon));
+                    let Some(mut grab) = grab else {
+                        self.niri.suppressed_buttons.insert(button_code);
+                        return;
+                    };
+                    grab.set_from_tab();
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                    self.niri
+                        .cursor_manager
+                        .set_cursor_image(CursorImageStatus::Named(icon));
+
+                    self.update_pointer_contents();
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button: button_code,
+                            state: button_state,
+                            serial,
+                            time: event.time(),
+                        },
+                    );
+                    pointer.frame(self);
+                    return;
+                }
+            }
+
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
@@ -3257,6 +3331,37 @@ impl State {
         pointer.frame(self);
     }
 
+    fn reset_tab_scroll(&mut self) {
+        self.niri.tab_scroll.reset();
+        self.niri.tab_scroll_window = None;
+    }
+
+    fn set_tab_scroll_target(&mut self, window: &Window) -> bool {
+        let is_current = self.niri.pointer_contents.window.as_ref().is_some_and(
+            |(current, hit)| current == window && matches!(hit, HitType::Tab),
+        );
+        if !is_current {
+            self.reset_tab_scroll();
+            return false;
+        }
+
+        if self.niri.tab_scroll_window.as_ref() != Some(window) {
+            self.niri.tab_scroll.reset();
+            self.niri.tab_scroll_window = Some(window.clone());
+        }
+        true
+    }
+
+    fn scroll_tab(&mut self, window: &Window, steps: i32) {
+        if steps == 0 {
+            return;
+        }
+
+        if self.niri.layout.scroll_tab(window, steps) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
     fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
         let pointer = &self.niri.seat.get_pointer().unwrap();
 
@@ -3289,10 +3394,16 @@ impl State {
         //
         // Recompute rather than using self.niri.pointer_contents in order to take into account
         // making the pointer visible and unsetting the tablet cursor location.
-        let should_handle_in_overview = self
-            .niri
-            .contents_under(pointer.current_location())
-            .overview;
+        let under = self.niri.contents_under(pointer.current_location());
+        let should_handle_in_overview = under.overview;
+        let tab_scroll_window = if pointer.is_grabbed() {
+            None
+        } else {
+            under.window.and_then(|(window, hit)| match hit {
+                HitType::Tab => Some(window),
+                HitType::Input { .. } | HitType::Activate | HitType::TabIndicator => None,
+            })
+        };
 
         let is_mru_open = self.niri.window_mru_ui.is_open();
 
@@ -3486,6 +3597,27 @@ impl State {
                 self.niri.vertical_wheel_tracker.reset();
             }
 
+            if let Some(window) = &tab_scroll_window {
+                self.update_pointer_contents();
+                if !self.set_tab_scroll_target(window) {
+                    return;
+                }
+                let horizontal = if horizontal_amount == 0.0 {
+                    0.0
+                } else {
+                    horizontal_amount_v120.unwrap_or(0.0)
+                };
+                let vertical = if vertical_amount == 0.0 {
+                    0.0
+                } else {
+                    vertical_amount_v120.unwrap_or(0.0)
+                };
+                let steps = self.niri.tab_scroll.wheel(horizontal, vertical);
+                self.scroll_tab(window, steps);
+                return;
+            }
+
+            self.reset_tab_scroll();
             if horizontal_amount == 0.0 && vertical_amount == 0.0 {
                 return;
             }
@@ -3499,6 +3631,7 @@ impl State {
             let vertical = event.amount(Axis::Vertical).unwrap_or(0.);
 
             if should_handle_in_overview && modifiers.is_empty() {
+                self.reset_tab_scroll();
                 let mut redraw = false;
 
                 let action = self
@@ -3594,6 +3727,7 @@ impl State {
             }
 
             if is_mru_open || self.niri.mods_with_finger_scroll_binds.contains(&modifiers) {
+                self.reset_tab_scroll();
                 let ticks = self
                     .niri
                     .horizontal_finger_scroll_tracker
@@ -3677,6 +3811,21 @@ impl State {
             }
         }
 
+        if matches!(source, AxisSource::Finger | AxisSource::Continuous) {
+            if let Some(window) = &tab_scroll_window {
+                self.update_pointer_contents();
+                if !self.set_tab_scroll_target(window) {
+                    return;
+                }
+                let horizontal = event.amount(Axis::Horizontal).unwrap_or(0.0);
+                let vertical = event.amount(Axis::Vertical).unwrap_or(0.0);
+                let steps = self.niri.tab_scroll.finger(horizontal, vertical);
+                self.scroll_tab(window, steps);
+                return;
+            }
+        }
+
+        self.reset_tab_scroll();
         self.update_pointer_contents();
 
         let device_scroll_factor = {
@@ -3814,6 +3963,7 @@ impl State {
 
             self.niri.pointer_visibility = PointerVisibility::Visible;
             self.niri.tablet_cursor_location = Some(pos);
+            self.niri.update_tab_hover();
         }
 
         // Redraw to update the cursor position.
@@ -4574,6 +4724,7 @@ impl State {
 
         // We're using touch, hide the pointer.
         self.niri.pointer_visibility = PointerVisibility::Disabled;
+        self.niri.update_tab_hover();
     }
     fn on_touch_up<I: InputBackend>(&mut self, evt: I::TouchUpEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
