@@ -105,6 +105,8 @@ pub fn override_peak_luminance(peak: f64, max_frame_avg_luminance: u16) -> (u16,
 pub enum RenderResult {
     /// The frame was submitted to the backend for presentation.
     Submitted,
+    /// Rendering finished, but submission is waiting for GPU completion.
+    Pending,
     /// Rendering succeeded, but there was no damage.
     NoDamage,
     /// The frame was not rendered and submitted, due to an error or otherwise.
@@ -295,6 +297,13 @@ impl Backend {
             Backend::Tty(tty) => tty.on_output_config_changed(niri),
             Backend::Winit(_) => (),
             Backend::Headless(_) => (),
+        }
+    }
+
+    pub fn set_host_cursor_visible(&mut self, visible: bool) {
+        match self {
+            Backend::Winit(winit) => winit.set_cursor_visible(visible),
+            Backend::Tty(_) | Backend::Headless(_) => (),
         }
     }
 

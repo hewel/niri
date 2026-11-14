@@ -79,6 +79,7 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
+    pub virtual_pointer: Option<ZwlrVirtualPointerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
@@ -156,7 +157,7 @@ pub struct Keyboard {
 #[derive(Debug)]
 pub enum KeyboardEvent {
     Enter {
-        keys: Vec<u8>,
+        keys: Vec<u32>,
     },
     Leave,
     Key {
@@ -304,6 +305,7 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             virtual_pointer_manager: None,
+            virtual_pointer: None,
             spbm: None,
             shm: None,
             viewporter: None,
@@ -638,10 +640,26 @@ impl State {
         surface.recent_keyboard_events()
     }
 
+    pub fn format_recent_keyboard_events(&mut self, surface: &WlSurface) -> String {
+        let surface = self.surfaces.get_mut(surface).unwrap();
+        surface.format_recent_keyboard_events()
+    }
+
     pub fn inhibit_shortcuts(&self, surface: &WlSurface) -> ZwpKeyboardShortcutsInhibitorV1 {
         let ksim = self.ksim.as_ref().unwrap();
         let seat = self.seats.keys().next().unwrap();
         ksim.inhibit_shortcuts(surface, seat, &self.qh, ())
+    }
+
+    pub fn virtual_pointer(&mut self) -> ZwlrVirtualPointerV1 {
+        if let Some(pointer) = &self.virtual_pointer {
+            return pointer.clone();
+        }
+
+        let manager = self.virtual_pointer_manager.as_ref().unwrap();
+        let pointer = manager.create_virtual_pointer(None, &self.qh, ());
+        self.virtual_pointer = Some(pointer.clone());
+        pointer
     }
 }
 
@@ -856,6 +874,17 @@ impl Surface {
         let start = self.keyboard_events_looked_at;
         self.keyboard_events_looked_at = self.keyboard_events_received.len();
         self.keyboard_events_received[start..].iter()
+    }
+
+    pub fn format_recent_keyboard_events(&mut self) -> String {
+        let mut buf = String::new();
+        for event in self.recent_keyboard_events() {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            write!(buf, "{event}").unwrap();
+        }
+        buf
     }
 }
 
@@ -1081,6 +1110,10 @@ impl Dispatch<WlKeyboard, WlSeat> for State {
             wl_keyboard::Event::Keymap { .. } => (),
             wl_keyboard::Event::Enter { surface, keys, .. } => {
                 keyboard.surface = Some(surface.clone());
+
+                // The order is arbitrary, but we need a fixed order for our tests.
+                let mut keys: Vec<u32> = bytemuck::pod_collect_to_vec(&keys);
+                keys.sort_unstable();
 
                 let event = KeyboardEvent::Enter { keys };
                 let surface = state.surfaces.get_mut(&surface).unwrap();

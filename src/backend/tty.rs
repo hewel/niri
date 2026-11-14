@@ -33,6 +33,7 @@ use smithay::backend::drm::{
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
+use smithay::backend::input::InputTime;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::RenderElementPresentationState;
@@ -47,14 +48,18 @@ use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::backend::SwapBuffersError;
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties};
+use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{Dispatcher, LoopHandle, RegistrationToken};
+use smithay::reexports::calloop::{
+    Dispatcher, Interest, LoopHandle, Mode as EventMode, PostAction, RegistrationToken,
+};
 use smithay::reexports::drm::control::atomic::AtomicModeReq;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{
     self, connector, crtc, plane, property, AtomicCommitFlags, Device, Mode as DrmMode, ModeFlags,
     ModeTypeFlags, PlaneType, ResourceHandle,
 };
+use smithay::reexports::drm::Device as _;
 use smithay::reexports::gbm::Modifier;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -138,12 +143,21 @@ pub type TtyRendererError<'render> = super::tty_renderer::TtyRendererError;
 type GbmDrmCompositor = DrmCompositor<
     GbmAllocator<DeviceFd>,
     GbmFramebufferExporter<DeviceFd>,
-    (OutputPresentationFeedback, Duration),
+    FrameUserData,
     DeviceFd,
 >;
 
+type FrameUserData = (OutputPresentationFeedback, Duration);
+
+struct PendingFrameSubmission {
+    remaining_sync_points: usize,
+    data: Option<FrameUserData>,
+}
+
 pub struct OutputDevice {
     token: RegistrationToken,
+    /// NVIDIA's KMS explicit-fence handling can occasionally scan out an unfinished frame.
+    is_nvidia: bool,
     // Can be None for display-only devices such as DisplayLink.
     render_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
@@ -425,6 +439,8 @@ struct Surface {
     time_since_presentation_plot_name: tracy_client::PlotName,
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
+    /// Plot of how long before the target presentation time all frame fences completed.
+    frame_completion_margin_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
 }
 
@@ -706,6 +722,14 @@ impl Tty {
             SessionEvent::PauseSession => {
                 debug!("pausing session");
 
+                // We won't receive key or button releases for whatever is held down while the
+                // session is paused, so forget about all of it.
+                //
+                // Slightly cursed to do from an idle... But we don't have State here conveniently,
+                // and it should be fine to delay this until the loop callback.
+                niri.event_loop
+                    .insert_idle(|state| state.release_held_inputs(InputTime::now()));
+
                 self.libinput.suspend();
 
                 for device in self.devices.values_mut() {
@@ -872,6 +896,24 @@ impl Tty {
             let _span = tracy_client::span!("DrmDevice::new");
             DrmDevice::new(device_fd.clone(), false)
         }?;
+        let is_nvidia = drm
+            .get_driver()
+            .map(|driver| {
+                driver
+                    .name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("nvidia")
+                    || driver
+                        .description()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("nvidia")
+            })
+            .unwrap_or_else(|err| {
+                warn!("could not query DRM driver for {path:?}: {err}");
+                false
+            });
         let gbm = {
             let _span = tracy_client::span!("GbmDevice::new");
             GbmDevice::new(device_fd.device_fd())
@@ -1021,6 +1063,7 @@ impl Tty {
 
         let device = OutputDevice {
             token,
+            is_nvidia,
             render_node,
             drm,
             gbm,
@@ -1897,6 +1940,9 @@ impl Tty {
         let presentation_misprediction_plot_name = tracy_client::PlotName::new_leak(format!(
             "{connector_name} presentation misprediction, ms"
         ));
+        let frame_completion_margin_plot_name = tracy_client::PlotName::new_leak(format!(
+            "{connector_name} frame completion margin, ms"
+        ));
         let sequence_delta_plot_name =
             tracy_client::PlotName::new_leak(format!("{connector_name} sequence delta"));
 
@@ -1919,6 +1965,7 @@ impl Tty {
             vblank_frame_name,
             time_since_presentation_plot_name,
             presentation_misprediction_plot_name,
+            frame_completion_margin_plot_name,
             sequence_delta_plot_name,
         };
 
@@ -2108,6 +2155,11 @@ impl Tty {
 
         let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
+            state @ RedrawState::WaitingForFrameCompletion { .. } => {
+                error!("received vblank while waiting for frame completion on {name}");
+                output_state.redraw_state = state;
+                return None;
+            }
             state @ (RedrawState::Idle
             | RedrawState::Queued
             | RedrawState::WaitingForEstimatedVBlank(_)
@@ -2121,6 +2173,14 @@ impl Tty {
                     "unexpected redraw state for output {name} (should be WaitingForVBlank); \
                      can happen when resuming from sleep or powering on monitors: {state:?}"
                 );
+
+                // Remove the leftover timer.
+                if let RedrawState::WaitingForEstimatedVBlank(token)
+                | RedrawState::WaitingForEstimatedVBlankAndQueued(token) = state
+                {
+                    niri.event_loop.remove(token);
+                }
+
                 true
             }
         };
@@ -2208,7 +2268,7 @@ impl Tty {
         Some(output)
     }
 
-    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) -> Output {
+    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) -> Option<Output> {
         let span = tracy_client::span!("Tty::on_estimated_vblank_timer");
 
         let name = output.name();
@@ -2216,23 +2276,39 @@ impl Tty {
 
         let Some(output_state) = niri.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
-            return output;
+            return None;
         };
 
-        // We waited for the timer, now we can send frame callbacks again.
-        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
-
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::Idle => unreachable!(),
-            RedrawState::Queued => unreachable!(),
-            RedrawState::WaitingForVBlank { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(_) => (),
             // The timer fired just in front of a redraw.
             RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
                 output_state.redraw_state = RedrawState::Queued;
-                return output;
+                output_state.frame_callback_sequence =
+                    output_state.frame_callback_sequence.wrapping_add(1);
+                return Some(output);
+            }
+            state @ RedrawState::WaitingForFrameCompletion { .. } => {
+                error!("received estimated vblank while waiting for frame completion on {name}");
+                // Keep the fence sources and defer callbacks and FIFO barriers until submission.
+                output_state.redraw_state = state;
+                return None;
+            }
+            // Unexpected states, but let's not crash the compositor.
+            // https://github.com/niri-wm/niri/issues/4781
+            state @ (RedrawState::Idle
+            | RedrawState::Queued
+            | RedrawState::WaitingForVBlank { .. }) => {
+                error!(
+                    "unexpected redraw state for output {name} \
+                    (should be WaitingForEstimatedVBlank or WaitingForEstimatedVBlankAndQueued): \
+                    {state:?}"
+                );
             }
         }
+
+        // We waited for the timer, now we can send frame callbacks again.
+        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
         if output_state.unfinished_animations_remain {
             niri.queue_redraw(&output);
@@ -2240,7 +2316,7 @@ impl Tty {
             niri.send_frame_callbacks(&output);
         }
 
-        output
+        Some(output)
     }
 
     pub fn seat_name(&self) -> String {
@@ -2627,13 +2703,33 @@ impl Tty {
                     surface.was_direct_scanout = Some(is_direct_scanout);
                 }
 
-                let needs_sync = res.needs_sync()
+                let wait_for_frame_completion = device.is_nvidia
                     || self
                         .config
                         .borrow()
                         .debug
                         .wait_for_frame_completion_before_queueing;
-                if needs_sync {
+                let mut completion_fences = Vec::new();
+                if wait_for_frame_completion {
+                    // Take every plane's synchronization point out of Smithay. Once they have all
+                    // completed, queue_frame() will submit the frame without IN_FENCE_FD.
+                    for sync in drm_compositor.take_pending_frame_sync_points() {
+                        if sync.is_reached() {
+                            continue;
+                        }
+
+                        if let Some(fd) = sync.export() {
+                            completion_fences.push((fd, sync));
+                        } else {
+                            // An unexportable fence cannot be integrated into calloop. This should
+                            // be unusual, so retain the old blocking behavior as a safe fallback.
+                            let _span = tracy_client::span!("wait for completion fallback");
+                            if let Err(err) = sync.wait() {
+                                warn!("error waiting for frame completion: {err:?}");
+                            }
+                        }
+                    }
+                } else if res.needs_sync() {
                     if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
                         let _span = tracy_client::span!("wait for completion");
                         if let Err(err) = element.sync.wait() {
@@ -2663,6 +2759,82 @@ impl Tty {
                         niri.take_presentation_feedbacks(output, &res.states);
                     let data = (presentation_feedbacks, target_presentation_time);
 
+                    if !completion_fences.is_empty() {
+                        let node = tty_state.node;
+                        let frame_was_locked = niri.is_locked();
+                        let crtc = tty_state.crtc;
+                        let pending = Rc::new(RefCell::new(PendingFrameSubmission {
+                            remaining_sync_points: completion_fences.len(),
+                            data: Some(data),
+                        }));
+                        let mut tokens = Vec::with_capacity(completion_fences.len());
+
+                        for (completion_fd, completion_sync) in completion_fences {
+                            let pending = pending.clone();
+                            let callback_output = output.clone();
+                            let source =
+                                Generic::new(completion_fd, Interest::READ, EventMode::OneShot);
+                            let token = niri
+                                .event_loop
+                                .insert_source(source, move |_, _, state| {
+                                    // The fd is the non-blocking wake-up mechanism. Verify the
+                                    // original sync point as well before considering this plane
+                                    // complete, in case a driver wakes the native fd prematurely.
+                                    let _span = tracy_client::span!("verify frame completion");
+                                    if !completion_sync.is_reached() {
+                                        debug!(
+                                            "native fence fd became readable before its sync point was signalled"
+                                        );
+                                    }
+                                    if let Err(err) = completion_sync.wait() {
+                                        warn!("error verifying frame completion: {err:?}");
+                                    }
+
+                                    let data = {
+                                        let mut pending = pending.borrow_mut();
+                                        pending.remaining_sync_points -= 1;
+                                        if pending.remaining_sync_points == 0 {
+                                            pending.data.take()
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    if let Some(data) = data {
+                                        state.backend.tty().queue_frame_after_completion(
+                                            &mut state.niri,
+                                            node,
+                                            crtc,
+                                            &callback_output,
+                                            data,
+                                            frame_was_locked,
+                                        );
+                                    }
+                                    Ok(PostAction::Remove)
+                                })
+                                .unwrap();
+                            tokens.push(token);
+                        }
+
+                        let output_state = niri.output_state.get_mut(output).unwrap();
+                        let new_state = RedrawState::WaitingForFrameCompletion {
+                            tokens,
+                            redraw_needed: false,
+                        };
+                        match mem::replace(&mut output_state.redraw_state, new_state) {
+                            RedrawState::Idle => unreachable!(),
+                            RedrawState::Queued => (),
+                            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                            RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                                niri.event_loop.remove(token);
+                            }
+                        }
+
+                        return RenderResult::Pending;
+                    }
+
                     match drm_compositor.queue_frame(data) {
                         Ok(()) => {
                             let output_state = niri.output_state.get_mut(output).unwrap();
@@ -2673,6 +2845,7 @@ impl Tty {
                                 RedrawState::Idle => unreachable!(),
                                 RedrawState::Queued => (),
                                 RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                                RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
                                 RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
                                 RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
                                     niri.event_loop.remove(token);
@@ -2708,6 +2881,84 @@ impl Tty {
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
 
         rv
+    }
+
+    fn queue_frame_after_completion(
+        &mut self,
+        niri: &mut Niri,
+        node: DrmNode,
+        crtc: crtc::Handle,
+        output: &Output,
+        data: FrameUserData,
+        frame_was_locked: bool,
+    ) {
+        let _span = tracy_client::span!("Tty::queue_frame_after_completion");
+        let name = output.name();
+
+        let Some(output_state) = niri.output_state.get_mut(output) else {
+            // The output was removed while its event source was ready to dispatch.
+            return;
+        };
+        let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+            RedrawState::WaitingForFrameCompletion { redraw_needed, .. } => redraw_needed,
+            state => {
+                error!("unexpected redraw state after frame completion on {name}: {state:?}");
+                output_state.redraw_state = state;
+                return;
+            }
+        };
+
+        let target_presentation_time = data.1;
+        let completion_margin_ms =
+            (target_presentation_time.as_secs_f64() - get_monotonic_time().as_secs_f64()) * 1000.;
+        let queue_result = self
+            .devices
+            .get_mut(&node)
+            .and_then(|device| device.surfaces.get_mut(&crtc))
+            .ok_or_else(|| anyhow!("output surface disappeared"))
+            .and_then(|surface| {
+                tracy_client::Client::running().unwrap().plot(
+                    surface.frame_completion_margin_plot_name,
+                    completion_margin_ms,
+                );
+                surface
+                    .compositor
+                    .queue_frame(data)
+                    .map_err(anyhow::Error::from)
+            });
+
+        match queue_result {
+            Ok(()) => {
+                let output_state = niri.output_state.get_mut(output).unwrap();
+                output_state.redraw_state = RedrawState::WaitingForVBlank { redraw_needed };
+
+                // The client buffers are latched only now, at actual KMS submission time.
+                output_state.frame_callback_sequence =
+                    output_state.frame_callback_sequence.wrapping_add(1);
+                niri.complete_lock_frame(output, RenderResult::Submitted, frame_was_locked);
+                niri.send_frame_callbacks(output);
+            }
+            Err(err) => {
+                warn!("error queueing frame after completion on {name}: {err}");
+
+                if let Some(surface) = self
+                    .devices
+                    .get_mut(&node)
+                    .and_then(|device| device.surfaces.get_mut(&crtc))
+                {
+                    drop(surface.vblank_frame.take());
+                }
+
+                // Match the normal render failure path: throttle until the predicted vblank,
+                // while preserving a redraw requested during the fence wait.
+                niri.output_state.get_mut(output).unwrap().redraw_state = RedrawState::Queued;
+                queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+                if redraw_needed {
+                    niri.queue_redraw(output);
+                }
+                niri.complete_lock_frame(output, RenderResult::Skipped, frame_was_locked);
+            }
+        }
     }
 
     pub fn change_vt(&mut self, vt: i32) {
@@ -3811,6 +4062,7 @@ fn queue_estimated_vblank_timer(
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
         RedrawState::WaitingForVBlank { .. } => unreachable!(),
+        RedrawState::WaitingForFrameCompletion { .. } => unreachable!(),
         RedrawState::WaitingForEstimatedVBlank(token)
         | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
             output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
@@ -3838,11 +4090,13 @@ fn queue_estimated_vblank_timer(
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {
-            let output = data
+            if let Some(output) = data
                 .backend
                 .tty()
-                .on_estimated_vblank_timer(&mut data.niri, output.clone());
-            data.signal_fifo(&output);
+                .on_estimated_vblank_timer(&mut data.niri, output.clone())
+            {
+                data.signal_fifo(&output);
+            }
             TimeoutAction::Drop
         })
         .unwrap();
