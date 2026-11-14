@@ -496,6 +496,9 @@ impl MergeWith<WorkspaceShadowPart> for WorkspaceShadow {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabIndicator {
     pub off: bool,
+    /// Show an interactive vertical rail outside client content, with non-interactive title hints.
+    /// Reuse layout gaps and reserve only the missing gutter, even for normally hidden single tabs.
+    pub show_title: bool,
     pub hide_when_single_tab: bool,
     pub place_within_column: bool,
     pub gap: f64,
@@ -516,6 +519,7 @@ impl Default for TabIndicator {
     fn default() -> Self {
         Self {
             off: false,
+            show_title: false,
             hide_when_single_tab: false,
             place_within_column: false,
             gap: 5.,
@@ -545,6 +549,7 @@ impl MergeWith<TabIndicatorPart> for TabIndicator {
 
         merge!(
             (self, part),
+            show_title,
             hide_when_single_tab,
             place_within_column,
             gap,
@@ -570,6 +575,8 @@ pub struct TabIndicatorPart {
     pub off: bool,
     #[knuffel(child)]
     pub on: bool,
+    #[knuffel(child)]
+    pub show_title: Option<Flag>,
     #[knuffel(child)]
     pub hide_when_single_tab: Option<Flag>,
     #[knuffel(child)]

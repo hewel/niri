@@ -10,6 +10,7 @@ use smithay::wayland::shell::xdg::PopupSurface;
 
 use crate::layer::{MappedLayer, ResolvedLayerRules};
 use crate::niri::State;
+use crate::render_helpers::snapshot::BackgroundCapturePolicy;
 use crate::utils::{is_mapped, output_size, send_scale_transform};
 
 impl WlrLayerShellHandler for State {
@@ -180,6 +181,12 @@ impl State {
             }
         } else {
             // The surface is unmapped.
+            let config = self.niri.config.borrow();
+            let rules =
+                ResolvedLayerRules::compute(&config.layer_rules, layer, self.niri.is_at_startup);
+            BackgroundCapturePolicy::for_layer(layer).update(rules.block_out_from);
+            drop(config);
+
             if self.niri.mapped_layer_surfaces.remove(layer).is_some() {
                 // A mapped surface got unmapped via a null commit. Now it needs to do a new
                 // initial commit again.

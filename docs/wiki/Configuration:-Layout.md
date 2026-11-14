@@ -66,6 +66,7 @@ layout {
     tab-indicator {
         // off
         on
+        // show-title true
         hide-when-single-tab
         place-within-column
         gap 5
@@ -438,27 +439,64 @@ Controls the appearance of the tab indicator that appears next to columns in tab
 
 Set `off` to hide the tab indicator.
 
-Set `hide-when-single-tab` to hide the indicator for tabbed columns that only have a single window.
+Set `show-title true` to replace the compact indicator with an interactive vertical rail to the left of the window.
+It defaults to `false`, preserving the compact indicator; compact mode remains fully supported.
+The rail never overlaps application content: its 12-logical-pixel-wide hit cells have 2 logical pixels of clearance on each side.
+This requires a 16-logical-pixel gutter, reusing `layout.gaps` and reserving only any missing width.
+With zero gaps it reserves the full gutter; with the default gaps it needs no additional width.
+Fixed-width clients keep their configured width and the column grows by this deficit.
+Proportional-width columns keep their footprint and give the missing gutter width to the rail instead of the client.
+Each cell is normally 24 logical pixels tall, with a narrower visible marker; cells compress vertically when necessary to fit the window.
+Geometry is aligned to physical pixels, including at fractional output scales.
+`position`, `length`, `place-within-column`, `width`, `gap`, and `gaps-between-tabs` configure compact mode only.
+Colors, gradients, and `corner-radius` also style the rail.
+`off` disables the indicator and its space reservation in either mode.
 
-Set `place-within-column` to put the tab indicator "within" the column, rather than outside.
+Title rails are always hidden for single-window columns during normal use, regardless of `hide-when-single-tab`.
+These columns retain the gutter reservation, so revealing a single-window drop target during an interactive window move never resizes the client.
+Hovering does not expand the rail or change its hit area.
+
+Hover a marker to show a single-line title tooltip, ellipsized when necessary and limited to 320 logical pixels.
+The tooltip has an opaque background and contrasting text to remain readable over arbitrary content.
+It may visually overlap application content, but it never intercepts mouse input or acts as a drop target, and disappears when the pointer enters the application.
+Windows without a title use their app ID, then `Untitled` as a fallback.
+Capture protection also applies to title tooltips.
+There are no close buttons: click a marker to activate its tab, use the scroll wheel to switch tabs, or middle-click a marker to close its window.
+Drag vertically along the rail to reorder, drag away to create a new column, or drag onto another rail to move that window into the destination column.
+
+```kdl
+layout {
+    default-column-display "tabbed"
+
+    tab-indicator {
+        show-title true
+        // Optional marker corner radius.
+        corner-radius 8
+    }
+}
+```
+
+In compact mode, set `hide-when-single-tab` to hide the indicator for tabbed columns that only have a single window.
+
+In compact mode, set `place-within-column` to put the tab indicator "within" the column, rather than outside.
 This will include it in column sizing and avoid overlaying adjacent columns.
 
-`gap` sets the gap between the tab indicator and the window in logical pixels.
+In compact mode, `gap` sets the gap between the tab indicator and the window in logical pixels.
 The gap can be negative, this will put the tab indicator on top of the window.
 
-`width` sets the thickness of the indicator in logical pixels.
+In compact mode, `width` sets the thickness of the indicator in logical pixels.
 
-`length` controls the length of the indicator.
+In compact mode, `length` controls the length of the indicator.
 Set the `total-proportion` property to make tabs take up this much length relative to the window size.
 By default, the tab indicator has length equal to half of the window size, or `length total-proportion=0.5`.
 
-`position` sets the position of the tab indicator relative to the window.
+In compact mode, `position` sets the position of the tab indicator relative to the window.
 It can be `left`, `right`, `top`, or `bottom`.
 
-`gaps-between-tabs` controls the gap between individual tabs in logical pixels.
+In compact mode, `gaps-between-tabs` controls the gap between individual tabs in logical pixels.
 
 `corner-radius` sets the rounded corner radius for tabs in the indicator in logical pixels.
-When `gaps-between-tabs` is zero, only the first and the last tabs have rounded corners, otherwise all tabs do.
+In compact mode, when `gaps-between-tabs` is zero, only the first and the last tabs have rounded corners, otherwise all tabs do.
 
 `active-color`, `inactive-color`, `urgent-color`, `active-gradient`, `inactive-gradient`, `urgent-gradient` let you override the colors for the tabs.
 They have the same semantics as the border and focus ring colors and gradients.

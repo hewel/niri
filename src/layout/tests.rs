@@ -15,6 +15,7 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod tabbed_mouse;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {
@@ -118,12 +119,12 @@ impl TestWindow {
                 if self.0.animate_next_configure.get() {
                     self.0.animation_snapshot.replace(Some(RenderSnapshot {
                         contents: Vec::new(),
-                        contents_with_blocked_out_bg: None,
+                        capture_textures: Default::default(),
+                        background: Default::default(),
                         blocked_out_contents: Vec::new(),
                         block_out_from: None,
                         size: self.0.bbox.get().size.to_f64(),
                         texture: OnceCell::new(),
-                        texture_with_blocked_out_bg: Default::default(),
                         blocked_out_texture: OnceCell::new(),
                     }));
                 }
@@ -1618,7 +1619,7 @@ impl Op {
                 let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
                     return;
                 };
-                layout.interactive_move_begin(window, &output, Point::from((px, py)));
+                layout.interactive_move_begin(window, &output, Point::from((px, py)), false);
             }
             Op::InteractiveMoveUpdate {
                 window,

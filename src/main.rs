@@ -39,16 +39,6 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set backtrace defaults if not set.
-    if env::var_os("RUST_BACKTRACE").is_none() {
-        env::set_var("RUST_BACKTRACE", "1");
-        REMOVE_ENV_RUST_BACKTRACE.store(true, Ordering::Relaxed);
-    }
-    if env::var_os("RUST_LIB_BACKTRACE").is_none() {
-        env::set_var("RUST_LIB_BACKTRACE", "0");
-        REMOVE_ENV_RUST_LIB_BACKTRACE.store(true, Ordering::Relaxed);
-    }
-
     let directives = env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_owned());
     let env_filter = EnvFilter::builder().parse_lossy(directives);
     tracing_subscriber::fmt()
@@ -57,6 +47,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(env_filter)
         .with_ansi_sanitization(false)
         .init();
+
+    if let Some(result) = niri::utils::spawning::run_spawn_helper() {
+        return result.map_err(Into::into);
+    }
+
+    // Set backtrace defaults only for the compositor, not for the application helper.
+    if env::var_os("RUST_BACKTRACE").is_none() {
+        env::set_var("RUST_BACKTRACE", "1");
+        REMOVE_ENV_RUST_BACKTRACE.store(true, Ordering::Relaxed);
+    }
+    if env::var_os("RUST_LIB_BACKTRACE").is_none() {
+        env::set_var("RUST_LIB_BACKTRACE", "0");
+        REMOVE_ENV_RUST_LIB_BACKTRACE.store(true, Ordering::Relaxed);
+    }
 
     if env::var_os("NOTIFY_SOCKET").is_some() {
         IS_SYSTEMD_SERVICE.store(true, Ordering::Relaxed);

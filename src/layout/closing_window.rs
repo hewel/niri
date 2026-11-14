@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use anyhow::Context as _;
 use glam::{Mat3, Vec2};
-use niri_config::BlockOutFrom;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -20,43 +19,26 @@ use crate::niri_render_elements;
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
+use crate::render_helpers::snapshot::SnapshotBackground;
 use crate::render_helpers::texture::{
     TextureBuffer, TextureRenderElement, UniversalTextureRenderElement,
 };
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::TransactionBlocker;
 
+type SnapshotBuffer = (TextureBuffer<TtyOffscreen>, Point<f64, Logical>);
+
 #[derive(Debug)]
 pub struct ClosingWindow {
-    /// Contents of the window.
-    buffer: TextureBuffer<TtyOffscreen>,
-
-    /// Contents that are not blocked out, but the background is blocked out.
-    ///
-    /// If `None` then the background doesn't have any blocked-out surfaces, and normal `buffer`
-    /// can be used instead.
-    buffer_with_blocked_out_bg: Option<TextureBuffer<TtyOffscreen>>,
-
-    /// Blocked-out contents of the window.
-    blocked_out_buffer: TextureBuffer<TtyOffscreen>,
-
-    /// Where the window should be blocked out from.
-    block_out_from: Option<BlockOutFrom>,
+    /// Fully baked variants; an unavailable or revoked capture is skipped, never substituted.
+    buffers: [Option<SnapshotBuffer>; RenderTarget::COUNT],
+    background: SnapshotBackground,
 
     /// Size of the window geometry.
     geo_size: Size<f64, Logical>,
 
     /// Position in the workspace.
     pos: Point<f64, Logical>,
-
-    /// How much the texture should be offset.
-    buffer_offset: Point<f64, Logical>,
-
-    /// How much the texture with blocked-out bg should be offset.
-    buffer_with_blocked_out_bg_offset: Point<f64, Logical>,
-
-    /// How much the blocked-out texture should be offset.
-    blocked_out_buffer_offset: Point<f64, Logical>,
 
     /// The closing animation.
     anim_state: AnimationState,
@@ -112,50 +94,40 @@ impl ClosingWindow {
     {
         let _span = tracy_client::span!("ClosingWindow::new");
 
-        let (texture, geo) = snapshot
-            .contents_texture(renderer, scale)
-            .context("error rendering contents")?;
-        let (texture, geo) = (texture.clone(), *geo);
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
-        let buffer_offset = geo.loc.to_f64().to_logical(scale);
-
-        let (buffer_with_blocked_out_bg, buffer_with_blocked_out_bg_offset) =
-            if snapshot.contents_with_blocked_out_bg.is_some() {
-                let (texture, geo) = snapshot
-                    .contents_with_blocked_out_bg_texture(renderer, scale)
-                    .context("error rendering contents with blocked-out bg")?;
-                let (texture, geo) = (texture.clone(), *geo);
+        let mut buffers = std::array::from_fn(|_| None);
+        for target in [
+            RenderTarget::Output,
+            RenderTarget::Screencast,
+            RenderTarget::ScreenCapture,
+        ] {
+            let texture = snapshot.texture(
+                RenderCtx {
+                    renderer,
+                    target,
+                    xray: None,
+                },
+                scale,
+            );
+            if target == RenderTarget::Output {
+                texture.context("error rendering contents")?;
+            }
+            if let Some((texture, geo)) = texture {
                 let buffer = TextureBuffer::from_texture(
                     renderer,
-                    texture,
+                    texture.clone(),
                     scale,
                     Transform::Normal,
                     Vec::new(),
                 );
-                (Some(buffer), geo.loc.to_f64().to_logical(scale))
-            } else {
-                (None, Point::default())
-            };
-
-        let (texture, geo) = snapshot
-            .blocked_out_texture(renderer, scale)
-            .context("error rendering blocked-out contents")?;
-        let (texture, geo) = (texture.clone(), *geo);
-        let blocked_out_buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
-        let blocked_out_buffer_offset = geo.loc.to_f64().to_logical(scale);
+                buffers[target as usize] = Some((buffer, geo.loc.to_f64().to_logical(scale)));
+            }
+        }
 
         Ok(Self {
-            buffer,
-            buffer_with_blocked_out_bg,
-            blocked_out_buffer,
-            block_out_from: snapshot.block_out_from,
+            buffers,
+            background: snapshot.background,
             geo_size,
             pos,
-            buffer_offset,
-            buffer_with_blocked_out_bg_offset,
-            blocked_out_buffer_offset,
             anim_state: AnimationState::new(blocker, anim),
             random_seed: fastrand::f32(),
         })
@@ -185,17 +157,12 @@ impl ClosingWindow {
         ctx: RenderCtx<R>,
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
-    ) -> ClosingWindowRenderElement {
-        let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
-            (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
-        } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
-            (
-                self.buffer_with_blocked_out_bg.as_ref().unwrap(),
-                self.buffer_with_blocked_out_bg_offset,
-            )
-        } else {
-            (&self.buffer, self.buffer_offset)
-        };
+    ) -> Option<ClosingWindowRenderElement> {
+        if !self.background.is_valid(ctx.target) {
+            return None;
+        }
+        let (buffer, offset) = self.buffers[ctx.target as usize].as_ref()?;
+        let offset = *offset;
 
         let anim = match &self.anim_state {
             AnimationState::Waiting { .. } => {
@@ -219,7 +186,7 @@ impl ClosingWindow {
                     Relocate::Relative,
                 );
 
-                return elem.into();
+                return Some(elem.into());
             }
             AnimationState::Animating(anim) => anim,
         };
@@ -245,34 +212,36 @@ impl ClosingWindow {
             let input_to_geo = Mat3::from_scale(area_size / geo_size)
                 * Mat3::from_translation((area_loc - geo_loc) / area_size);
 
-            let tex_scale = self.buffer.texture_scale();
+            let tex_scale = buffer.texture_scale();
             let tex_scale = Vec2::new(tex_scale.x as f32, tex_scale.y as f32);
             let tex_loc = Vec2::new(offset.x as f32, offset.y as f32);
-            let tex_size = self.buffer.texture().size();
+            let tex_size = buffer.texture().size();
             let tex_size = Vec2::new(tex_size.w as f32, tex_size.h as f32) / tex_scale;
 
             let geo_to_tex =
                 Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
 
-            return ShaderRenderElement::new(
-                ProgramType::Close,
-                view_rect.size,
-                None,
-                scale.x as f32,
-                1.,
-                Rc::new([
-                    mat3_uniform("niri_input_to_geo", input_to_geo),
-                    Uniform::new("niri_geo_size", geo_size.to_array()),
-                    mat3_uniform("niri_geo_to_tex", geo_to_tex),
-                    Uniform::new("niri_progress", progress as f32),
-                    Uniform::new("niri_clamped_progress", clamped_progress as f32),
-                    Uniform::new("niri_random_seed", self.random_seed),
-                ]),
-                HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
-                Kind::Unspecified,
-            )
-            .with_location(Point::from((0., 0.)))
-            .into();
+            return Some(
+                ShaderRenderElement::new(
+                    ProgramType::Close,
+                    view_rect.size,
+                    None,
+                    scale.x as f32,
+                    1.,
+                    Rc::new([
+                        mat3_uniform("niri_input_to_geo", input_to_geo),
+                        Uniform::new("niri_geo_size", geo_size.to_array()),
+                        mat3_uniform("niri_geo_to_tex", geo_to_tex),
+                        Uniform::new("niri_progress", progress as f32),
+                        Uniform::new("niri_clamped_progress", clamped_progress as f32),
+                        Uniform::new("niri_random_seed", self.random_seed),
+                    ]),
+                    HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
+                    Kind::Unspecified,
+                )
+                .with_location(Point::from((0., 0.)))
+                .into(),
+            );
         }
 
         let elem = TextureRenderElement::from_texture_buffer(
@@ -301,6 +270,6 @@ impl ClosingWindow {
             Relocate::Relative,
         );
 
-        elem.into()
+        Some(elem.into())
     }
 }

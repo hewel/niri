@@ -29,6 +29,7 @@ pub struct MoveGrab {
     window: Window,
     gesture: GestureState,
     enable_view_offset: bool,
+    from_tab: bool,
     move_icon: CursorIcon,
 
     // Accumulated and applied in frame().
@@ -63,6 +64,7 @@ impl MoveGrab {
             window,
             gesture: GestureState::Recognizing,
             enable_view_offset,
+            from_tab: false,
             // Moving windows by their titlebars uses the default cursor by default.
             move_icon: move_icon.unwrap_or(CursorIcon::Default),
             new_location: location,
@@ -73,6 +75,10 @@ impl MoveGrab {
 
     pub fn is_move(&self) -> bool {
         self.gesture == GestureState::Move
+    }
+
+    pub fn set_from_tab(&mut self) {
+        self.from_tab = true;
     }
 
     pub fn view_offset_output(&self) -> Option<&Output> {
@@ -121,6 +127,7 @@ impl MoveGrab {
             self.window.clone(),
             &self.start_output,
             self.start_pos_within_output,
+            self.from_tab,
         ) {
             // Can no longer start the move.
             return false;

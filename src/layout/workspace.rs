@@ -31,6 +31,7 @@ use crate::layout::{LayoutElementRenderElement, RenderLayer};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::shadow::ShadowRenderElement;
+use crate::render_helpers::snapshot::SnapshotBackground;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -1749,7 +1750,7 @@ impl<W: LayoutElement> Workspace<W> {
         &mut self,
         renderer: &mut R,
         xray: Option<&Xray>,
-        xray_has_blocked_out_layers: bool,
+        background: SnapshotBackground,
         xray_pos: XrayPos,
         window: &W::Id,
     ) where
@@ -1768,7 +1769,7 @@ impl<W: LayoutElement> Workspace<W> {
                 tile.store_unmap_snapshot_if_empty(
                     renderer,
                     xray,
-                    xray_has_blocked_out_layers,
+                    background,
                     xray_pos,
                 );
                 return;

@@ -158,6 +158,7 @@ use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
+use crate::input::tab_scroll::TabScrollState;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_horizontal_wheel_binds,
     mods_with_mouse_binds, mods_with_tablet_stylus_binds, mods_with_vertical_wheel_binds,
@@ -165,7 +166,8 @@ use crate::input::{
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
-use crate::layer::MappedLayer;
+use crate::layer::{MappedLayer, ResolvedLayerRules};
+use crate::layout::tab_indicator::TabIndicatorRenderElement;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
@@ -186,6 +188,7 @@ use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
+use crate::render_helpers::snapshot::{BackgroundCapturePolicy, SnapshotBackground};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::{TextureBuffer, UniversalTextureRenderElement};
@@ -460,6 +463,8 @@ pub struct Niri {
     pub vertical_finger_scroll_tracker: ScrollTracker,
     pub horizontal_finger_scroll_tracker: ScrollTracker,
     pub mods_with_finger_scroll_binds: HashSet<Modifiers>,
+    pub tab_scroll: TabScrollState,
+    pub tab_scroll_window: Option<Window>,
 
     pub lock_state: LockState,
 
@@ -1272,6 +1277,7 @@ impl State {
         );
         pointer.frame(self);
 
+        self.niri.update_tab_hover();
         self.niri.maybe_activate_pointer_constraint();
 
         // We do not show the pointer on programmatic or keyboard movement.
@@ -1427,6 +1433,7 @@ impl State {
         // Don't move the mouse pointer while the user is interacting with the tablet, as it causes
         // unwanted jumps for the client.
         if self.niri.tablet_cursor_location.is_some() {
+            self.niri.update_tab_hover();
             return;
         }
 
@@ -1443,6 +1450,7 @@ impl State {
             if let Some((output, _)) = self.niri.output_under(location) {
                 let monitor = self.niri.layout.monitor_for_output(output).unwrap();
                 if monitor.are_transitions_ongoing() {
+                    self.niri.update_tab_hover();
                     return;
                 }
             }
@@ -1474,6 +1482,7 @@ impl State {
         // We're not changing the global cursor location here, so if the contents did not change,
         // then nothing changed.
         if self.niri.pointer_contents == under {
+            self.niri.update_tab_hover();
             return false;
         }
 
@@ -1486,6 +1495,7 @@ impl State {
             // be triggered through warp-mouse-to-focus combined with hide-when-typing.
             under = PointContents::default();
             if self.niri.pointer_contents == under {
+                self.niri.update_tab_hover();
                 return false;
             }
         }
@@ -1502,6 +1512,7 @@ impl State {
             },
         );
 
+        self.niri.update_tab_hover();
         self.niri.maybe_activate_pointer_constraint();
 
         true
@@ -2485,6 +2496,7 @@ impl State {
                 .open(renderer, screenshots, default_output, show_pointer, path)
         });
 
+        self.niri.update_tab_hover();
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
@@ -2584,6 +2596,7 @@ impl State {
         }
         self.niri.window_mru_ui.remove_window(id);
         self.niri.layout.remove_window(&window, transaction.clone());
+        self.niri.update_tab_hover();
 
         // An unshared transaction completes immediately and needs no deadline.
         if !transaction.is_last() {
@@ -2631,19 +2644,16 @@ impl State {
                     self.niri.populate_xray_elements(vk_ctx, output, &frame);
                 }
 
-                // If any background layer has block_out_from, also fill the Screencast xray
-                // buffer so the unmap snapshot can render a buffer with blocked-out background.
-                //
-                // This will be used in Tile::render_snapshot().
-                let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                if has_blocked_out {
-                    let mut screencast_ctx = RenderCtx {
-                        target: RenderTarget::Screencast,
-                        ..ctx.r()
-                    };
-                    if let Some(gles_ctx) = screencast_ctx.as_gles() {
+                // Prepare only distinct capture backgrounds required by the snapshot.
+                let background = self.niri.snapshot_background(output);
+                for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+                    if background.target(target) != target {
+                        continue;
+                    }
+                    let mut capture_ctx = RenderCtx { target, ..ctx.r() };
+                    if let Some(gles_ctx) = capture_ctx.as_gles() {
                         self.niri.populate_xray_elements(gles_ctx, output, &frame);
-                    } else if let Some(vk_ctx) = screencast_ctx.as_vulkan() {
+                    } else if let Some(vk_ctx) = capture_ctx.as_vulkan() {
                         self.niri.populate_xray_elements(vk_ctx, output, &frame);
                     }
                 }
@@ -2652,13 +2662,16 @@ impl State {
                 self.niri.layout.store_unmap_snapshot(
                     renderer,
                     Some(&state.xray),
-                    has_blocked_out,
+                    background,
                     window,
                 );
             } else {
-                self.niri
-                    .layout
-                    .store_unmap_snapshot(renderer, None, false, window);
+                self.niri.layout.store_unmap_snapshot(
+                    renderer,
+                    None,
+                    SnapshotBackground::default(),
+                    window,
+                );
             }
         });
     }
@@ -3511,6 +3524,8 @@ impl Niri {
             vertical_finger_scroll_tracker: ScrollTracker::new(10),
             horizontal_finger_scroll_tracker: ScrollTracker::new(10),
             mods_with_finger_scroll_binds,
+            tab_scroll: TabScrollState::default(),
+            tab_scroll_window: None,
 
             lock_state: LockState::Unlocked,
             locked_hint: None,
@@ -5373,6 +5388,22 @@ impl Niri {
             }};
         }
 
+        // Keep destination labels readable above the dragged window, but below shell overlays.
+        macro_rules! push_tab_drop_targets {
+            () => {{
+                if self.layout.interactive_move_is_scrolling() {
+                    mon.render_tab_insert_hint(ctx.renderer, &mut |elem| push(elem.into()));
+                    for (ws, geo) in mon.workspaces_with_render_geo() {
+                        ws.scrolling().render_tab_drop_targets(ctx.r(), &mut |elem| {
+                            if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
+                                push(elem.into());
+                            }
+                        });
+                    }
+                }
+            }};
+        }
+
         // The overlay layer elements go next.
         push_popups_from_layer!(Layer::Overlay);
         push_normal_from_layer!(Layer::Overlay);
@@ -5380,6 +5411,7 @@ impl Niri {
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
+            push_tab_drop_targets!();
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
@@ -5403,6 +5435,7 @@ impl Niri {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
+            push_tab_drop_targets!();
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
@@ -5486,19 +5519,21 @@ impl Niri {
         });
     }
 
-    /// Checks if any background layer surface has `block_out_from` set.
-    pub fn has_blocked_out_background_layers(&self, output: &Output) -> bool {
+    /// Records all sampled background sources, including currently unprotected layers.
+    fn snapshot_background(&self, output: &Output) -> SnapshotBackground {
         let layer_map = layer_map_for_output(output);
+        let mut background = SnapshotBackground::default();
         for for_backdrop in [false, true] {
             for (mapped, _geo) in
                 self.layers_in_render_order(&layer_map, Layer::Background, for_backdrop)
             {
-                if mapped.rules().block_out_from.is_some() {
-                    return true;
-                }
+                background.add(
+                    BackgroundCapturePolicy::for_layer(mapped.surface()),
+                    mapped.rules().block_out_from,
+                );
             }
         }
-        false
+        background
     }
 
     fn layers_in_render_order<'a>(
@@ -7584,6 +7619,8 @@ impl Niri {
                 self.lock_state = other;
             }
         }
+
+        self.update_tab_hover();
     }
 
     pub fn unlock(&mut self) {
@@ -7820,6 +7857,48 @@ impl Niri {
         }
     }
 
+    pub fn update_tab_hover(&mut self) {
+        let can_hover = self.pointer_visibility.is_visible()
+            && self.tablet_cursor_location.is_none()
+            && !self.exit_confirm_dialog.is_open()
+            && !self.is_locked()
+            && !self.screenshot_ui.is_open()
+            && !self.window_mru_ui.is_open();
+        let pointer = self.seat.get_pointer().unwrap();
+        let can_hover = can_hover && !pointer.is_grabbed();
+
+        // Closing the hovered tab can leave its old identity in pointer_contents until the
+        // next pointer refresh. Resolve the replacement before updating its title hint.
+        let replacement = (can_hover && self.pointer_contents.window.as_ref().is_some_and(
+            |(window, hit)| matches!(hit, HitType::Tab) && !self.layout.has_window(window),
+        )).then(|| self.contents_under(pointer.current_location()));
+        let contents = replacement.as_ref().unwrap_or(&self.pointer_contents);
+        let tab = contents.window.as_ref().and_then(|(window, hit)| {
+            let HitType::Tab = hit else {
+                return None;
+            };
+            (can_hover && self.layout.has_window(window)).then_some(window)
+        });
+
+        if tab.is_none() {
+            self.tab_scroll.reset();
+            self.tab_scroll_window = None;
+        }
+
+        // Resolve the current tile index even when the pointer is stationary: a preceding
+        // tab can close or move without changing the hovered window's identity.
+        let changed = self.layout.set_tab_hover(tab);
+
+        if tab.is_some() {
+            self.cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(CursorIcon::Default));
+        }
+
+        if changed {
+            self.queue_redraw_all();
+        }
+    }
+
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
@@ -7834,6 +7913,10 @@ impl Niri {
             return;
         }
 
+        if matches!(&new_focus.window, Some((_, HitType::Tab | HitType::TabIndicator))) {
+            return;
+        }
+
         // Recompute the current pointer focus because we don't update it during animations.
         let current_focus = self.contents_under(pointer.current_location());
 
@@ -7845,17 +7928,7 @@ impl Niri {
 
         if let Some(window) = &new_focus.window {
             if !self.layout.is_overview_open() && current_focus.window.as_ref() != Some(window) {
-                let (window, hit) = window;
-
-                // Don't trigger focus-follows-mouse over the tab indicator.
-                if matches!(
-                    hit,
-                    HitType::Activate {
-                        is_tab_indicator: true
-                    }
-                ) {
-                    return;
-                }
+                let (window, _) = window;
 
                 if !self.layout.should_trigger_focus_follows_mouse_on(window) {
                     return;
@@ -8021,6 +8094,20 @@ impl Niri {
                     mapped.update_config(&config);
                 }
             }
+
+            // LayerMap retains the same layer-shell object during null-buffer unmap.
+            // Its old snapshots must observe rule changes before it maps again.
+            for output in self.layout.outputs() {
+                let map = layer_map_for_output(output);
+                for layer in map.layers() {
+                    if self.mapped_layer_surfaces.contains_key(layer) {
+                        continue;
+                    }
+                    let resolved = ResolvedLayerRules::compute(rules, layer, self.is_at_startup);
+                    changed |=
+                        BackgroundCapturePolicy::for_layer(layer).update(resolved.block_out_from);
+                }
+            }
         }
 
         if changed {
@@ -8055,6 +8142,7 @@ impl Niri {
                 // frame of hover.
                 if state.niri.pointer_visibility.is_visible() {
                     state.niri.pointer_visibility = PointerVisibility::Hidden;
+                    state.niri.update_tab_hover();
                     state.niri.queue_redraw_all();
                 }
 
@@ -8202,6 +8290,9 @@ niri_render_elements! {
     OutputRenderElements<R> => {
         Monitor = MonitorRenderElement<R>,
         RescaledTile = RescaleRenderElement<TileRenderElement<R>>,
+        TabDropTarget = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            TabIndicatorRenderElement
+        >>>,
         LayerSurface = LayerSurfaceRenderElement<R>,
         RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             LayerSurfaceRenderElement<R>

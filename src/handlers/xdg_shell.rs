@@ -1480,15 +1480,19 @@ impl State {
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
-            if mapped.recompute_window_rules(window_rules, self.niri.is_at_startup) {
-                drop(config);
-                let output = output.cloned();
-                let window = mapped.window.clone();
+            let output = output.cloned();
+            let changed_window = mapped
+                .recompute_window_rules(window_rules, self.niri.is_at_startup)
+                .then(|| mapped.window.clone());
+            drop(config);
+            if let Some(window) = changed_window {
                 self.niri.layout.update_window(&window, None);
+            }
 
-                if let Some(output) = output {
-                    self.niri.queue_redraw(&output);
-                }
+            // Titles (or their app-id fallback) can change without surface damage or any
+            // matching rule changing. Repaint the compositor-owned label in that case too.
+            if let Some(output) = output {
+                self.niri.queue_redraw(&output);
             }
         }
     }

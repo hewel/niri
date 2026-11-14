@@ -154,6 +154,7 @@ pub(super) struct InsertHint {
 struct InsertHintRenderLoc {
     workspace: InsertWorkspace,
     location: Point<f64, Logical>,
+    above_dragged_window: bool,
 }
 
 #[derive(Debug)]
@@ -1141,6 +1142,7 @@ impl<W: LayoutElement> Monitor<W> {
                             self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                                 workspace: hint.workspace,
                                 location: area.loc,
+                                above_dragged_window: ws.scrolling().has_tab_insert_hint(hint.position),
                             });
                         }
                     } else {
@@ -1181,6 +1183,7 @@ impl<W: LayoutElement> Monitor<W> {
                     self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                         workspace: hint.workspace,
                         location: hint_loc,
+                        above_dragged_window: false,
                     });
                 }
             }
@@ -1671,6 +1674,37 @@ impl<W: LayoutElement> Monitor<W> {
         self.fullscreen_window_above_top_layer().is_some()
     }
 
+    pub fn render_tab_insert_hint<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let Some(loc) = self.insert_hint_render_loc.filter(|loc| {
+            loc.above_dragged_window && !self.options.layout.insert_hint.off
+        }) else {
+            return;
+        };
+        let Some((_, geo)) = self.workspaces_with_render_geo()
+            .find(|(ws, _)| loc.workspace == InsertWorkspace::Existing(ws.id()))
+        else {
+            return;
+        };
+        let scale = self.scale.fractional_scale();
+        let zoom = self.overview_zoom();
+        let crop = Rectangle::from_size(self.view_size).to_physical_precise_round(scale);
+        self.insert_hint_element.render(renderer, loc.location, &mut |elem| {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, crop) {
+                let elem = MonitorInnerRenderElement::InsertHint(elem);
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), zoom);
+                push(RelocateRenderElement::from_element(
+                    elem,
+                    geo.loc.to_physical_precise_round(scale),
+                    Relocate::Relative,
+                ));
+            }
+        });
+    }
+
     pub fn render_insert_hint_between_workspaces<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -1717,7 +1751,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         let insert_hint_render_loc = self
             .insert_hint_render_loc
-            .filter(|_| !self.options.layout.insert_hint.off);
+            .filter(|loc| !self.options.layout.insert_hint.off && !loc.above_dragged_window);
 
         let scale_relocate = move |geo: Rectangle<f64, Logical>, elem| {
             let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);

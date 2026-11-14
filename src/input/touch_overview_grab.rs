@@ -88,6 +88,7 @@ impl TouchOverviewGrab {
                         window.clone(),
                         &self.output,
                         self.start_pos_within_output,
+                        false,
                     )
                 {
                     self.gesture = GestureState::InteractiveMove;

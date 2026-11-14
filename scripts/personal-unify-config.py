@@ -2,11 +2,15 @@
 """Prepare/apply a checked, one-time migration to the host's existing niri config."""
 
 import argparse
+import ctypes
+import errno
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -82,14 +86,80 @@ def prepare(config, stage, binary):
 
 
 def replace_file(source, destination):
-    # Keep the old file available until its replacement is fully copied.
-    fd, temporary = tempfile.mkstemp(prefix=".niri-migrate-", dir=destination.parent)
-    os.close(fd)
+    """Atomically exchange entries; source retains the actual displaced inode."""
+    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if rename is None:
+        raise OSError(errno.ENOSYS, "renameat2(RENAME_EXCHANGE) is required")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 2):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+class MigrationConflict(SystemExit):
+    pass
+
+
+def conflict(stage, detail):
+    raise MigrationConflict(
+        f"{detail}; user edits and migration evidence preserved, manual recovery required. "
+        f"Inspect {stage / 'recovery'}, {stage / 'original'} and {stage / 'candidate'} "
+        "alongside the live config. Preserve the whole stage before reconciling or repreparing."
+    )
+
+
+def identity(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Not a regular configuration file: {path}")
+    return [info.st_dev, info.st_ino]
+
+
+def check_recovery(stage):
+    # An intent becomes visible before exchange. An orphan without an intent
+    # cannot have been exchanged and is retained, not used or cleaned up.
+    for intent in sorted((stage / "recovery").glob("*/intent.json")):
+        try:
+            operation = json.loads(intent.read_text())
+            saved = intent.parent / "saved"
+            if identity(saved) == operation["replacement_inode"]:
+                allowed = (operation["replacement_sha256"],)
+            else:
+                allowed = operation["allowed"]
+            if digest(saved) not in allowed:
+                conflict(stage, f"Saved configuration changed at {saved}")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            conflict(stage, f"Uncertain recovery record {intent}: {error}")
+
+
+def preserve_replace(stage, source, destination, allowed):
+    check_recovery(stage)
     try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, destination)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+        identity(destination)
+        if digest(destination) not in allowed:
+            conflict(stage, f"Configuration changed before replacement: {destination}")
+        recovery = stage / "recovery"
+        recovery.mkdir(mode=0o700, exist_ok=True)
+        operation = Path(tempfile.mkdtemp(prefix="replace-", dir=recovery))
+        saved = operation / "saved"
+        shutil.copy2(source, saved)
+        replacement_sha = digest(saved)
+        write_record(operation / "intent.json", {
+            "target": str(destination.absolute()),
+            "replacement_inode": identity(saved),
+            "replacement_sha256": replacement_sha,
+            "allowed": list(allowed),
+        })
+        replace_file(saved, destination)
+        # Never discard saved, even after success: an editor may still hold its
+        # inode open and save to it after these checks.
+        check_recovery(stage)
+        identity(destination)
+        if digest(destination) != replacement_sha:
+            conflict(stage, f"Configuration changed during replacement: {destination}")
+    except (OSError, ValueError) as error:
+        conflict(stage, f"Cannot safely exchange configuration {destination}: {error}")
 
 
 def write_record(path, record):
@@ -103,10 +173,21 @@ def write_record(path, record):
 
 
 def apply(config, stage, binary):
+    if not stage.exists():
+        return
+    # This serializes migration journals only. Editors need not take this lock;
+    # preserving displaced inodes, not the lock, protects their data.
+    with (stage / ".apply.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _apply(config, stage, binary)
+
+
+def _apply(config, stage, binary):
     manifest = stage / "manifest.json"
     if not manifest.exists():
         return
     record = json.loads(manifest.read_text())
+    check_recovery(stage)
     if record["state"] == "applied":
         return
     for name, sha in record["changes"].items():
@@ -122,9 +203,10 @@ def apply(config, stage, binary):
         # old/new bytes. Never roll back edits made after that interruption.
         for name in CHANGED:
             if digest(config / name) not in (record["files"][name], record["changes"][name]):
-                raise SystemExit("Interrupted migration followed by user edits; manual recovery required.")
+                conflict(stage, "Interrupted migration followed by user edits")
         for name in CHANGED:
-            replace_file(stage / "original" / name, config / name)
+            preserve_replace(stage, stage / "original" / name, config / name,
+                             (record["files"][name], record["changes"][name]))
         record["state"] = "prepared"
         write_record(manifest, record)
     if record["state"] != "prepared":
@@ -146,17 +228,26 @@ def apply(config, stage, binary):
         for name in CHANGED:
             if digest(config / name) != record["files"][name]:
                 raise SystemExit(f"Config edited during migration: {name}; prior writes will be rolled back.")
-            # Register before replacement so interruption immediately after
-            # os.replace cannot leave an untracked partial write.
+            # Register before exchange so interruption immediately afterward
+            # cannot leave a partial write outside synchronous rollback.
             changed.append(name)
-            replace_file(stage / "candidate" / name, config / name)
+            preserve_replace(stage, stage / "candidate" / name, config / name,
+                             (record["files"][name],))
         validate(binary, config / "config.kdl")
+        check_recovery(stage)
+        for name in CHANGED:
+            if digest(config / name) != record["changes"][name]:
+                conflict(stage, f"Configuration changed after replacement: {config / name}")
+    except MigrationConflict:
+        raise
     except BaseException:
+        check_recovery(stage)
         for name in changed:
             if digest(config / name) not in (record["files"][name], record["changes"][name]):
-                raise SystemExit("Migration failed followed by user edits; files preserved, manual recovery required.")
+                conflict(stage, "Migration failed followed by user edits")
         for name in reversed(changed):
-            replace_file(stage / "original" / name, config / name)
+            preserve_replace(stage, stage / "original" / name, config / name,
+                             (record["files"][name], record["changes"][name]))
         record["state"] = "prepared"
         write_record(manifest, record)
         raise

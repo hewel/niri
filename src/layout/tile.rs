@@ -27,7 +27,7 @@ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{RenderSnapshot, SnapshotBackground, SnapshotTexture};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -396,6 +396,15 @@ impl<W: LayoutElement> Tile<W> {
         let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
 
         let rules = self.window.rules();
+        // Rule updates arrive here even if no capture occurs before a later loosening.
+        // Include the animation snapshot just taken above as well as any pending unmap.
+        if let Some(resize) = &mut self.resize_animation {
+            resize.snapshot.restrict_capture(rules.block_out_from);
+        }
+        if let Some(snapshot) = &mut self.unmap_snapshot {
+            snapshot.restrict_capture(rules.block_out_from);
+        }
+
         let mut border_config = self.options.layout.border.merged_with(&rules.border);
         border_config.width = round_max1(border_config.width);
         self.border.update_config(border_config.into());
@@ -932,9 +941,7 @@ impl<W: LayoutElement> Tile<W> {
             let win_pos = self.buf_loc() + offset;
             Some(HitType::Input { win_pos })
         } else if self.is_in_activation_region(point) {
-            Some(HitType::Activate {
-                is_tab_indicator: false,
-            })
+            Some(HitType::Activate)
         } else {
             None
         }
@@ -1195,7 +1202,14 @@ impl<W: LayoutElement> Tile<W> {
             }
 
             if !pushed_resize {
-                let fallback_buffer = SolidColorBuffer::new(area.size, [1., 0., 0., 1.]);
+                // A protected capture must fail closed even if its black texture cannot
+                // be rendered. Keep the normal Output diagnostic fallback unchanged.
+                let color = if ctx.target.should_block_out(resize.snapshot.block_out_from) {
+                    [0., 0., 0., 1.]
+                } else {
+                    [1., 0., 0., 1.]
+                };
+                let fallback_buffer = SolidColorBuffer::new(area.size, color);
                 let elem = SolidColorRenderElement::from_buffer(
                     &fallback_buffer,
                     area.loc,
@@ -1449,7 +1463,7 @@ impl<W: LayoutElement> Tile<W> {
         &mut self,
         renderer: &mut R,
         xray: Option<&Xray>,
-        xray_has_blocked_out_layers: bool,
+        background: SnapshotBackground,
         xray_pos: XrayPos,
     ) where
         LayoutElementRenderElement<R>: RenderElement<R>,
@@ -1461,15 +1475,14 @@ impl<W: LayoutElement> Tile<W> {
             return;
         }
 
-        self.unmap_snapshot =
-            Some(self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos));
+        self.unmap_snapshot = Some(self.render_snapshot(renderer, xray, background, xray_pos));
     }
 
     fn render_snapshot<R: NiriCaptureRenderer>(
         &self,
         renderer: &mut R,
         xray: Option<&Xray>,
-        xray_has_blocked_out_layers: bool,
+        background: SnapshotBackground,
         xray_pos: XrayPos,
     ) -> TileRenderSnapshot
     where
@@ -1500,27 +1513,13 @@ impl<W: LayoutElement> Tile<W> {
             }
         };
 
-        let mut contents = Vec::new();
-        self.render(
-            RenderCtx {
-                target: RenderTarget::Output,
-                renderer,
-                xray,
-            },
-            Point::from((0., 0.)),
-            xray_pos,
-            false,
-            &mut |elem| contents.push(elem),
-        );
-
-        let mut render_capture = |xray: Option<&Xray>| {
-            // Preserve a separate unblocked window with capture-safe background only when
-            // sensitive background layers make that combination necessary.
-            let contents_with_blocked_out_bg = if xray.is_some() && xray_has_blocked_out_layers {
-                let mut contents = Vec::new();
+        let block_out_from = self.window.rules().block_out_from;
+        let mut render = |target| {
+            let mut contents = Vec::new();
+            let mut render = || {
                 self.render(
                     RenderCtx {
-                        target: RenderTarget::Output,
+                        target,
                         renderer,
                         xray,
                     },
@@ -1529,47 +1528,55 @@ impl<W: LayoutElement> Tile<W> {
                     false,
                     &mut |elem| contents.push(elem),
                 );
-                Some(bake(renderer, &contents))
-            } else {
-                None
             };
-
-            let mut blocked_out_contents = Vec::new();
-            self.render(
-                RenderCtx {
-                    target: RenderTarget::Screencast,
-                    renderer,
-                    xray,
-                },
-                Point::from((0., 0.)),
-                xray_pos,
-                false,
-                &mut |elem| blocked_out_contents.push(elem),
-            );
-            (contents_with_blocked_out_bg, blocked_out_contents)
+            if let Some(xray) = xray {
+                xray.with_snapshot_background(background.target(target), |_| render());
+            } else {
+                render();
+            }
+            bake(renderer, &contents)
         };
-        let (contents_with_blocked_out_bg, blocked_out_contents) = if let Some(xray) = xray {
-            xray.with_snapshot_background(xray_has_blocked_out_layers, |xray| {
-                render_capture(Some(xray))
-            })
-        } else {
-            render_capture(None)
+        let texture = render(RenderTarget::Output);
+        let key = |target: RenderTarget| {
+            (
+                target.should_block_out(block_out_from),
+                background.target(target),
+                // A resize still samples an older snapshot with independent target policy.
+                // Until that complete input is proven equivalent, bake every target separately.
+                self.resize_animation.as_ref().map(|_| target),
+            )
         };
-
-        let texture = bake(renderer, &contents);
-        let blocked_out_texture = bake(renderer, &blocked_out_contents);
+        let mut capture_textures: [Option<SnapshotTexture>; RenderTarget::COUNT] =
+            Default::default();
+        let mut previous = RenderTarget::Output;
+        for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+            if key(target) == key(RenderTarget::Output) {
+                continue;
+            }
+            let baked = if previous != RenderTarget::Output && key(target) == key(previous) {
+                // Clone the GPU handle, not its pixels. A failed required bake stays failed.
+                capture_textures[previous as usize]
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .clone()
+            } else {
+                render(target)
+            };
+            capture_textures[target as usize] = Some(OnceCell::from(baked));
+            previous = target;
+        }
 
         RenderSnapshot {
             contents: Vec::new(),
-            contents_with_blocked_out_bg: contents_with_blocked_out_bg.as_ref().map(|_| Vec::new()),
+            capture_textures,
+            background,
             blocked_out_contents: Vec::new(),
-            block_out_from: self.window.rules().block_out_from,
+            block_out_from,
             size: self.animated_tile_size(),
             texture: OnceCell::from(texture),
-            texture_with_blocked_out_bg: contents_with_blocked_out_bg
-                .map(OnceCell::from)
-                .unwrap_or_default(),
-            blocked_out_texture: OnceCell::from(blocked_out_texture),
+            blocked_out_texture: Default::default(),
         }
     }
 

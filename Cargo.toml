@@ -50,6 +50,11 @@ rust-version.workspace = true
 readme = "README.md"
 keywords = ["wayland", "compositor", "tiling", "smithay", "wm"]
 
+# Re-executes as the spawn helper and target application in isolated processes.
+[[test]]
+name = "spawning"
+harness = false
+
 [dependencies]
 accesskit = { version = "0.25", optional = true }
 accesskit_unix = { version = "0.23", optional = true }
