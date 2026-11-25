@@ -210,3 +210,97 @@ fn failed_pending_frame_retains_protected_output_and_completes_lock() {
     assert!(events.lock().unwrap().locked);
     assert!(!events.lock().unwrap().finished);
 }
+
+#[test]
+fn active_screen_transition_is_cleared_and_suppressed_while_locked() {
+    use niri_config::Config;
+    use smithay::backend::allocator::Fourcc;
+    use smithay::utils::{Scale, Transform};
+
+    use super::gpu;
+    use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+
+    let config = Config::parse_mem(
+        r##"
+        layout { gaps 0; focus-ring { off; }; border { off; }; background-color "#000000"; }
+        animations { window-open { off; }; }
+        window-rule {
+            open-maximized-to-edges true
+        }
+    "##,
+    )
+    .unwrap();
+    let mut f = Fixture::with_config(config);
+    if let Err(err) = f.niri_state().backend.headless().add_renderer() {
+        gpu::skip("session lock screen transition renderer", &err);
+        return;
+    }
+    f.add_output(1, (128, 128));
+    let id = f.add_client();
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    let green_buf = window
+        .spbm
+        .create_u32_rgba_buffer(0, u32::MAX, 0, u32::MAX, &window.qh, ());
+    window.surface.attach(Some(&green_buf), 0, 0);
+    window.set_size(128, 128);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    let output = f.niri_output(1);
+    {
+        let state = f.niri_state();
+        let renderer = state.backend.headless().renderer().unwrap();
+        state.niri.do_screen_transition(renderer, Some(5000));
+    }
+    assert!(f.niri().output_state[&output].has_active_screen_transition());
+
+    // Begin locking: `continue_to_locking` clears screen transitions and suppresses locked pixels.
+    let events = Arc::new(Mutex::new(LockEvents::default()));
+    let client = f.client(id);
+    let global = client
+        .state
+        .globals
+        .iter()
+        .find(|global| global.interface == ExtSessionLockManagerV1::interface().name)
+        .unwrap();
+    let registry = client.display.get_registry(&client.qh, ());
+    let manager: ExtSessionLockManagerV1 = registry.bind(global.name, 1, &client.qh, ());
+    let _lock = manager.lock(&client.qh, events);
+    f.roundtrip(id);
+
+    f.niri().continue_to_locking();
+    assert!(!f.niri().output_state[&output].has_active_screen_transition());
+
+    f.niri().update_render_elements(Some(&output));
+    let state = f.niri_state();
+    let renderer = state.backend.headless().renderer().unwrap();
+    let elements = state.niri.render_to_vec(
+        RenderCtx {
+            renderer,
+            target: RenderTarget::Output,
+            xray: None,
+        },
+        &output,
+        false,
+    );
+    let pixels = render_to_vec(
+        renderer,
+        (128, 128).into(),
+        Scale::from(1.),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        elements.iter().rev(),
+    )
+    .unwrap();
+    let green_pixels = pixels
+        .chunks_exact(4)
+        .filter(|p| p[1] > 200 && p[0] < 50)
+        .count();
+    assert_eq!(green_pixels, 0, "pre-lock desktop leaked through screen transition");
+}

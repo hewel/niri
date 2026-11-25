@@ -31,7 +31,7 @@ use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{BlockOutState, RenderSnapshot};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::{
     push_elements_from_surface_tree, render_snapshot_from_surface_tree,
@@ -460,7 +460,7 @@ impl Mapped {
             capture_textures: Default::default(),
             background: Default::default(),
             blocked_out_contents,
-            block_out_from: self.rules().block_out_from,
+            block_out_states: BlockOutState::array_from_rule(self.rules().block_out_from),
             size,
             texture: Default::default(),
             blocked_out_texture: Default::default(),
@@ -706,6 +706,10 @@ impl LayoutElement for Mapped {
         alpha: f32,
         push: &mut dyn FnMut(LayoutElementRenderElement<R>),
     ) {
+        if ctx.target.should_hide(self.rules.block_out_from) {
+            return;
+        }
+
         if ctx.target.should_block_out(self.rules.block_out_from) {
             let mut buffer = self.block_out_buffer.borrow_mut();
             buffer.resize(self.window.geometry().size.to_f64());

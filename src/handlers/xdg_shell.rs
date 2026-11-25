@@ -966,16 +966,9 @@ impl XdgShellHandler for State {
 
 impl XdgDecorationHandler for State {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // With xdg-decoration v2, a decoration object can be created for an already mapped
-        // toplevel, including right after destroying a previous decoration object. In that case
-        // the protocol requires the previously negotiated mode to be retained, so restore the
-        // last acked mode if there is one. Otherwise, advertise our preferred mode. (If we want
-        // CSD, we hide this global altogether.)
-        let prev_mode =
-            toplevel.with_committed_state(|current| current.and_then(|s| s.decoration_mode));
+        // If we want CSD, we hide this global altogether.
         toplevel.with_pending_state(|state| {
-            state.decoration_mode =
-                Some(prev_mode.unwrap_or(zxdg_toplevel_decoration_v1::Mode::ServerSide));
+            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
         });
 
         // The new decoration object needs a configure carrying its initial mode. If an initial
@@ -1036,23 +1029,9 @@ impl XdgDecorationHandler for State {
         }
     }
 
-    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
-        // The protocol requires the surface to switch back to client-side decorations at the
-        // next commit, unless a new decoration object is created first (in which case
-        // new_decoration() will run before any commit and override this).
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
-        });
-
-        if toplevel.is_initial_configure_sent() {
-            // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
-            let surface = toplevel.wl_surface();
-            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
-                mapped.set_needs_configure();
-            } else {
-                toplevel.send_configure();
-            }
-        }
+    fn decoration_destroyed(&mut self, _toplevel: ToplevelSurface) {
+        // We rely on Smithay's decoration_mode (which it resets on its own), and don't track any
+        // state on our own. Nothing to do here.
     }
 }
 
@@ -1141,8 +1120,8 @@ impl State {
         let mon = mon.or_else(|| {
             rules
                 .open_on_output
-                .as_deref()
-                .and_then(|name| {
+                .iter()
+                .find_map(|name| {
                     self.niri
                         .global_space
                         .outputs()
@@ -1339,6 +1318,11 @@ impl State {
             Some((layer_surface.clone(), o))
         }) {
             self.unconstrain_layer_shell_popup(popup, &layer_surface, output);
+        } else if let Some(output) = self.niri.layout.outputs().find_map(|o| {
+            let lock = self.niri.output_state[o].lock_surface.as_ref()?;
+            (lock.wl_surface() == &root).then_some(o)
+        }) {
+            self.unconstrain_lock_popup(popup, output);
         }
     }
 
@@ -1391,6 +1375,22 @@ impl State {
         let geo_off = Point::new(0., 0.);
 
         // Don't add padding to layer-shell popups. It's not really needed, and it's unexpected.
+        self.position_popup_within_rect(popup, geo_off, target.to_f64(), false);
+    }
+
+    pub fn unconstrain_lock_popup(&self, popup: &PopupKind, output: &Output) {
+        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+
+        // The target geometry for the positioner should be relative to its parent's geometry, so
+        // we will compute that here.
+        let mut target = Rectangle::from_size(output_geo.size);
+
+        target.loc -= get_popup_toplevel_coords(popup);
+
+        // Lock surfaces don't have geometry.
+        let geo_off = Point::new(0., 0.);
+
+        // Don't add padding to lock popups.
         self.position_popup_within_rect(popup, geo_off, target.to_f64(), false);
     }
 

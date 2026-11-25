@@ -184,14 +184,22 @@ pub fn render_output<R: NiriRenderer>(
 
     // Render element lists are front-to-back: whatever is pushed first ends up on top. So all
     // thumbnails go in first, and the backdrops follow to sit behind them.
+    let mut visible_thumbs = Vec::with_capacity(thumbs.len());
     for thumb in &thumbs {
         let Some(mapped) = niri
             .layout
             .minimized_windows()
             .find(|mapped| mapped.id() == thumb.id)
         else {
+            visible_thumbs.push(false);
             continue;
         };
+
+        if ctx.target.should_hide(mapped.rules().block_out_from) {
+            visible_thumbs.push(false);
+            continue;
+        }
+        visible_thumbs.push(true);
 
         let thumb_scale = Scale {
             x: thumb.geo.size.w / thumb.window_size.w,
@@ -210,7 +218,14 @@ pub fn render_output<R: NiriRenderer>(
         });
     }
 
-    for (thumb, buffer) in thumbs.iter().zip(backdrop_buffers.iter_mut()) {
+    for ((thumb, buffer), visible) in thumbs
+        .iter()
+        .zip(backdrop_buffers.iter_mut())
+        .zip(visible_thumbs)
+    {
+        if !visible {
+            continue;
+        }
         let backdrop_geo = Rectangle::new(
             thumb.geo.loc - Point::from((BACKDROP_PADDING, BACKDROP_PADDING)),
             thumb.geo.size + Size::from((BACKDROP_PADDING * 2., BACKDROP_PADDING * 2.)),

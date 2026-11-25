@@ -175,23 +175,30 @@ fn destroy_reverts_to_client_side() {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    // Destroying the decoration object switches the surface back to client-side decorations.
+    // Destroying the decoration object schedules a switch back to client-side decorations on
+    // the next surface commit. Before that commit, the previously negotiated mode remains active.
     let window = f.client(id).window(&surface);
     let _ = recent_modes(window);
     window.destroy_decoration();
-    f.double_roundtrip(id);
-
-    // We send a configure so the client can redraw with decorations.
-    let window = f.client(id).window(&surface);
-    assert!(window.recent_configures().count() >= 1);
-    window.ack_last_and_commit();
     f.double_roundtrip(id);
 
     let mapped = f.niri().layout.windows().next().unwrap().1;
     let mode = mapped
         .toplevel()
         .with_committed_state(|current| current.and_then(|s| s.decoration_mode));
-    assert_eq!(mode, Some(ServerMode::ClientSide));
+    assert_eq!(mode, Some(ServerMode::ServerSide));
+
+    // Once the surface commits, Smithay applies the destruction and resets decoration_mode to None.
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let mapped = f.niri().layout.windows().next().unwrap().1;
+    let mode = mapped
+        .toplevel()
+        .with_committed_state(|current| current.and_then(|s| s.decoration_mode));
+    assert_eq!(mode, None);
 }
 
 #[test]
@@ -214,9 +221,9 @@ fn recreate_before_commit_retains_mode() {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    // Destroy and immediately recreate the decoration object without a commit in between. The
-    // previously negotiated mode must be retained rather than reset to our server-side
-    // preference, and the new decoration object must receive a configure of its own.
+    // Destroy and immediately recreate the decoration object without a surface commit in between.
+    // The pending destroy is canceled and the previously negotiated mode is retained across a
+    // subsequent commit without requiring a fresh configure/ack cycle.
     let window = f.client(id).window(&surface);
     let _ = recent_modes(window);
     window.destroy_decoration();
@@ -224,10 +231,27 @@ fn recreate_before_commit_retains_mode() {
     f.double_roundtrip(id);
 
     let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let mapped = f.niri().layout.windows().next().unwrap().1;
+    let mode = mapped
+        .toplevel()
+        .with_committed_state(|current| current.and_then(|s| s.decoration_mode));
+    assert_eq!(mode, Some(ServerMode::ClientSide));
+
+    // Requests on the replacement decoration object still configure the toplevel as usual.
+    let window = f.client(id).window(&surface);
+    let _ = recent_modes(window);
+    window.set_decoration_mode(Mode::ServerSide);
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
     let modes = recent_modes(window);
     assert!(!modes.is_empty());
     assert!(
-        modes.iter().all(|m| *m == Some(Mode::ClientSide)),
+        modes.iter().all(|m| *m == Some(Mode::ServerSide)),
         "{modes:?}"
     );
 }

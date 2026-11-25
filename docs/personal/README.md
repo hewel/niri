@@ -9,15 +9,15 @@ lifecycle, Glass preparation boundary, shared corner contours and refactor evide
 
 ## Source boundary
 
-The selected source records are machine-readable in [versions.env](versions.env). See [the November upstream integration report](UPSTREAM-20261114.md) for conflict resolutions and validation limits.
+The selected source records are machine-readable in [versions.env](versions.env). See [the November 26 upstream integration report](UPSTREAM-20261126.md) (and [the earlier November 14 report](UPSTREAM-20261114.md)) for conflict resolutions and validation limits.
 
 | Source | Selected commit |
 | --- | --- |
 | Spicy niri integrated revision | `1bfaa833dce073d53d9db72c2c12a77f452864eb` |
-| Custom Smithay integration | `c0e58aa59f5acf753169cdc0b9c5adfccc8397c2` |
+| Custom Smithay integration | `b0b1b9fccc33255d1de676af99c7394719d3abce` |
 | Niri-glass source | `72ee16331994b43a9460b713b828a218a023a857` |
 | Official niri base used to derive the Glass changes | `49fc6117fd6c043adaa2ead316b82db5ed735d36` |
-| Official niri integrated revision | `73a04441fccc78294c3899af8f8cdd2a1e38fa33` |
+| Official niri integrated revision | `6072f67d9fe0f1c1182f72cc5d4f2ca5f047bf9e` |
 
 Sources: [spicy niri](https://github.com/losnoco/niri), [spicy Smithay](https://github.com/losnoco/smithay), [Niri-glass](https://github.com/zaroutt/Niri-glass), and [official niri](https://github.com/niri-wm/niri).
 
@@ -92,7 +92,7 @@ git -C ../smithay checkout --detach "$SMITHAY_REV"
 
 For another machine, transfer both repositories or Git bundles preserving the selected Niri and Smithay integration commits and the personal base tag. Substitute those sources for the local clone paths. Cloning only public upstreams does not include the complete custom dependency pair.
 
-The selected niri and Smithay manifests declare Rust 1.87 as their minimum. The locked dependency set was tested with Rust/Cargo 1.98.0 on CachyOS; the minimum toolchain was not tested. Upstream Cargo features are unchanged, including Vulkan support. The build requires a C toolchain, `pkg-config`, Wayland, xkbcommon, libinput, libudev, libseat, EGL/GLES/GBM, libdisplay-info, Pango/Cairo, PipeWire, and Vulkan headers/loader. On this Arch-derived host, libseat is supplied by `seatd`. Check the repository's normal build documentation for package equivalents on other distributions.
+The selected niri and Smithay manifests declare Rust 1.88 as their minimum (not directly tested with a 1.88 toolchain). The locked dependency set was tested with Rust/Cargo 1.100.0 on CachyOS. Upstream Cargo features are unchanged, including Vulkan support. The build requires a C toolchain, `pkg-config`, Wayland, xkbcommon, libinput, libudev, libseat, EGL/GLES/GBM, libdisplay-info, Pango/Cairo, PipeWire, and Vulkan headers/loader. On this Arch-derived host, libseat is supplied by `seatd`. Check the repository's normal build documentation for package equivalents on other distributions.
 
 The helper verifies the exact adjacent Smithay revision, rejects tracked modifications in either checkout, checks the recorded spicy ancestry, builds a release executable with `--locked`, and validates all five example configurations. It records niri's full HEAD through the existing `NIRI_BUILD_COMMIT` version mechanism. It does not fetch changing branch tips, install binaries or edit session configuration. Commit intended changes before running this reproducible build helper.
 

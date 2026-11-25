@@ -70,6 +70,7 @@ struct TabShaderParams {
     color_to: Color,
     radius: CornerRadius,
     scale: f32,
+    block_out_from: Option<BlockOutFrom>,
 }
 
 #[derive(Debug, Default)]
@@ -393,7 +394,6 @@ impl TabIndicator {
         true
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn update_render_elements<'a, W: LayoutElement + 'a>(
         &mut self,
         enabled: bool,
@@ -428,6 +428,7 @@ impl TabIndicator {
             color_to: Default::default(),
             radius: Default::default(),
             scale: 1.,
+            block_out_from: None,
         });
 
         if title_mode {
@@ -542,6 +543,7 @@ impl TabIndicator {
                 color_to,
                 radius,
                 scale: scale as f32,
+                block_out_from: tab.window.rules().block_out_from,
             };
             self.shader_params[idx] = params;
             let is_hovered = self.hovered == Some(idx);
@@ -699,7 +701,7 @@ impl TabIndicator {
         &self,
         renderer: &mut impl NiriRenderer,
         pos: Point<f64, Logical>,
-        _target: RenderTarget,
+        target: RenderTarget,
         push: &mut dyn FnMut(TabIndicatorRenderElement),
     ) {
         if self.config.off || (self.config.show_title && !self.is_visible(self.titles.len())) {
@@ -707,7 +709,10 @@ impl TabIndicator {
         }
         if BorderRenderElement::has_shader(renderer) {
             for (idx, (shader, loc)) in zip(&self.shaders, &self.shader_locs).enumerate() {
-                if self.shader_params[idx].size.w <= 0. || self.shader_params[idx].size.h <= 0. {
+                if self.shader_params[idx].size.w <= 0.
+                    || self.shader_params[idx].size.h <= 0.
+                    || target.should_hide(self.shader_params[idx].block_out_from)
+                {
                     continue;
                 }
                 let elem = shader.clone().with_location(pos + *loc);

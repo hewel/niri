@@ -1,7 +1,7 @@
 use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
 
-use niri_config::BlockOutFrom;
+use niri_config::{BlockOutFrom, BlockOutTarget};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::desktop::LayerSurface;
@@ -36,7 +36,9 @@ impl BackgroundCapturePolicy {
         let old = self.block_out_from.replace(new);
         let mut generations = self.generations.get();
         for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
-            if !target.should_block_out(old) && target.should_block_out(new) {
+            if (!target.should_block_out(old) && target.should_block_out(new))
+                || (!target.should_hide(old) && target.should_hide(new))
+            {
                 generations[target as usize] = generations[target as usize]
                     .checked_add(1)
                     .expect("background capture generation overflow");
@@ -44,6 +46,35 @@ impl BackgroundCapturePolicy {
         }
         self.generations.set(generations);
         old != new
+    }
+}
+
+/// Per-target monotonic protection state retained by historical snapshots.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BlockOutState {
+    #[default]
+    Visible,
+    Fill,
+    Hide,
+}
+
+impl BlockOutState {
+    pub fn from_rule(target: RenderTarget, rule: Option<BlockOutFrom>) -> Self {
+        if target.should_hide(rule) {
+            Self::Hide
+        } else if target.should_block_out(rule) {
+            Self::Fill
+        } else {
+            Self::Visible
+        }
+    }
+
+    pub fn array_from_rule(rule: Option<BlockOutFrom>) -> [Self; RenderTarget::COUNT] {
+        let mut states = [Self::Visible; RenderTarget::COUNT];
+        for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+            states[target as usize] = Self::from_rule(target, rule);
+        }
+        states
     }
 }
 
@@ -60,9 +91,9 @@ impl SnapshotBackground {
     pub fn add(&mut self, policy: &BackgroundCapturePolicy, block: Option<BlockOutFrom>) {
         self.sources
             .push((policy.generations.clone(), policy.generations.get()));
-        match block {
-            Some(BlockOutFrom::ScreenCapture) => self.screen_capture = true,
-            Some(BlockOutFrom::Screencast) => self.screencast_only = true,
+        match block.map(|rule| rule.target) {
+            Some(BlockOutTarget::ScreenCapture) => self.screen_capture = true,
+            Some(BlockOutTarget::Screencast) => self.screencast_only = true,
             None => (),
         }
     }
@@ -105,8 +136,8 @@ pub struct RenderSnapshot<C, B> {
     /// Relative to the geometry.
     pub blocked_out_contents: Vec<B>,
 
-    /// Initial window protection, monotonically tightened while its window remains mapped.
-    pub block_out_from: Option<BlockOutFrom>,
+    /// Per-target protection, monotonically tightened while its window remains mapped.
+    pub block_out_states: [BlockOutState; RenderTarget::COUNT],
 
     /// Visual size of the element at the point of the snapshot.
     pub size: Size<f64, Logical>,
@@ -119,29 +150,34 @@ pub struct RenderSnapshot<C, B> {
 }
 
 impl<C, B> RenderSnapshot<C, B> {
-    /// Restrict historical window samples, including already baked target variants.
-    /// Loosening the live window's rules must not revive these samples.
+    pub fn should_block_out(&self, target: RenderTarget) -> bool {
+        self.block_out_states[target as usize] != BlockOutState::Visible
+    }
+
+    pub fn should_hide(&self, target: RenderTarget) -> bool {
+        self.block_out_states[target as usize] == BlockOutState::Hide
+    }
+
+    /// Restrict historical window samples per capture target, including already baked variants.
+    /// Loosening or narrowing the live window's rules must not revive or weaken prior protection.
     pub fn restrict_capture(&mut self, restriction: Option<BlockOutFrom>) {
-        if restriction.is_none()
-            || self.block_out_from == Some(BlockOutFrom::ScreenCapture)
-            || self.block_out_from == restriction
-        {
+        if restriction.is_none() {
             return;
         }
 
         for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
-            if target.should_block_out(restriction) && !target.should_block_out(self.block_out_from)
-            {
+            let old = self.block_out_states[target as usize];
+            let new = old.max(BlockOutState::from_rule(target, restriction));
+            if new != old {
+                self.block_out_states[target as usize] = new;
                 // Resize snapshots have a black replacement. Prebaked tiles have no
                 // replacement elements: retain an explicit unavailable slot, not a
-                // route back to their normal texture.
-                self.capture_textures[target as usize] = self
-                    .blocked_out_contents
-                    .is_empty()
-                    .then(|| OnceCell::from(None));
+                // route back to their normal texture, and drop any baked Fill on Hide.
+                if self.blocked_out_contents.is_empty() {
+                    self.capture_textures[target as usize] = Some(OnceCell::from(None));
+                }
             }
         }
-        self.block_out_from = restriction;
     }
 }
 
@@ -250,7 +286,9 @@ where
         if let Some(texture) = &self.capture_textures[ctx.target as usize] {
             return texture.get().and_then(Option::as_ref);
         }
-        if ctx.target.should_block_out(self.block_out_from) {
+        // For a currently visible window resizing from a hidden snapshot, returning the black
+        // blocked-out replacement avoids exposing pre-rule pixels or triggering the red fallback.
+        if self.should_block_out(ctx.target) {
             self.blocked_out_texture(ctx.renderer, scale)
         } else {
             self.contents_texture(ctx.renderer, scale)

@@ -411,9 +411,10 @@ fn mixed_background_policies_keep_distinct_capture_snapshots() {
     assert!(green(&output) > 1000);
 }
 
-fn window_config(policy: &str) -> Config {
+fn window_config_rule(block_out_rule: &str) -> Config {
     Config::parse_mem(&format!(
         r##"
+        hotkey-overlay {{ skip-at-startup; }}
         layout {{ gaps 0; focus-ring {{ off; }}; border {{ off; }}; background-color "#0000ff"; }}
         animations {{
             window-open {{ off; }}
@@ -426,11 +427,15 @@ fn window_config(policy: &str) -> Config {
             default-window-height {{ fixed 64; }}
             default-floating-position x=32 y=32 relative-to="top-left"
             draw-border-with-background false
-            block-out-from "{policy}"
+            {block_out_rule}
         }}
     "##
     ))
     .unwrap()
+}
+
+fn window_config(policy: &str) -> Config {
+    window_config_rule(&format!("block-out-from \"{policy}\""))
 }
 
 fn attach_window_pattern(window: &super::client::Window, width: i32, height: i32) {
@@ -670,7 +675,7 @@ fn mapped_window_tightening_revokes_pending_capture_without_resurrection() {
 
 #[test]
 fn minimized_window_rules_restrict_retained_resize_and_pending_samples() {
-    use niri_config::BlockOutFrom;
+    use niri_config::{BlockOutFrom, BlockOutKind, BlockOutTarget};
     use wayland_client::Proxy as _;
 
     use crate::layout::LayoutElement as _;
@@ -704,7 +709,10 @@ fn minimized_window_rules_restrict_retained_resize_and_pending_samples() {
             assert_eq!(retained.id(), mapped_id);
             assert_eq!(
                 retained.rules().block_out_from,
-                Some(BlockOutFrom::ScreenCapture)
+                Some(BlockOutFrom {
+                    target: BlockOutTarget::ScreenCapture,
+                    kind: BlockOutKind::Fill,
+                })
             );
             if loosen {
                 // No capture or parent buffer commit between tightening and loosening.
@@ -739,5 +747,192 @@ fn minimized_window_rules_restrict_retained_resize_and_pending_samples() {
                 );
             }
         }
+    }
+}
+
+fn blue(pixels: &[u8]) -> usize {
+    pixels
+        .chunks_exact(4)
+        .filter(|p| p[2] > 200 && p[0] == 0 && p[1] == 0)
+        .count()
+}
+
+fn window_scene_rule(rule: &str) -> Option<(Fixture, ClientId, WlSurface)> {
+    let mut f = Fixture::with_config(window_config_rule(rule));
+    if let Err(err) = f.niri_state().backend.headless().add_renderer() {
+        gpu::skip("capture privacy renderer", &err);
+        return None;
+    }
+    f.add_output(1, (128, 128));
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    attach_window_pattern(window, 64, 64);
+    window.set_size(64, 64);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.niri().clock.set_rate(0.);
+    assert_eq!(canary(&pixels(&mut f, RenderTarget::Output)), (2048, 2048));
+    Some((f, id, surface))
+}
+
+fn protect_window_rule(f: &mut Fixture, rule: &str) {
+    f.niri().config.borrow_mut().window_rules = window_config_rule(rule).window_rules;
+    f.niri().recompute_window_rules();
+}
+
+#[test]
+fn hide_reveals_background_and_rejects_window_screenshot() {
+    let Some((mut f, id, surface)) =
+        window_scene_rule(r#"block-out-from "screen-capture" kind="hide""#)
+    else {
+        return;
+    };
+
+    // Normal output sees the 64x64 window over the 128x128 blue backdrop.
+    let out_px = pixels(&mut f, RenderTarget::Output);
+    assert_eq!(blue(&out_px), 128 * 128 - 64 * 64);
+    for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+        let px = pixels(&mut f, target);
+        assert_eq!(canary(&px), (0, 0), "{target:?}");
+        assert_eq!(blue(&px), 128 * 128, "{target:?} must reveal full background");
+    }
+
+    // Direct window screenshot must fail when the window is hidden from screen capture.
+    {
+        let output = f.niri_output(1);
+        let state = f.niri_state();
+        let mapped = state.niri.layout.windows().next().unwrap().1;
+        let renderer = state.backend.headless().renderer().unwrap();
+        let res = state
+            .niri
+            .screenshot_window(renderer, &output, mapped, false, false, None);
+        assert!(res.is_err(), "hidden window screenshot should fail");
+    }
+
+    // Closing animation stays visible on Output and completely hidden on capture targets.
+    close(&mut f, id, &surface, false);
+    assert_eq!(canary(&pixels(&mut f, RenderTarget::Output)), (2048, 2048));
+    for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+        let px = pixels(&mut f, target);
+        assert_eq!(canary(&px), (0, 0), "closing {target:?}");
+        assert_eq!(blue(&px), 128 * 128, "closing {target:?} must stay hidden");
+    }
+}
+
+#[test]
+fn mixed_rule_tightening_preserves_per_target_fill_and_hide() {
+    for reverse in [false, true] {
+        for resize in [false, true] {
+            let initial = if reverse {
+                r#"block-out-from "screencast" kind="hide""#
+            } else {
+                r#"block-out-from "screen-capture""#
+            };
+            let Some((mut f, id, surface)) = window_scene_rule(initial) else {
+                return;
+            };
+            if resize {
+                resize_window(&mut f, id, &surface);
+            }
+            // Pending-unmap child freezes a Mapped snapshot if resize wasn't triggered.
+            let child = f.client(id).create_committed_subsurface(&surface);
+            f.double_roundtrip(id);
+            child.destroy();
+            f.double_roundtrip(id);
+
+            // Tighten with the complementary rule without any intervening render/capture.
+            let second = if reverse {
+                r#"block-out-from "screen-capture""#
+            } else {
+                r#"block-out-from "screencast" kind="hide""#
+            };
+            protect_window_rule(&mut f, second);
+
+            close(&mut f, id, &surface, false);
+            let output_canary = canary(&pixels(&mut f, RenderTarget::Output));
+            assert!(output_canary.0 > 1000 && output_canary.1 > 1000);
+
+            let screenshot = pixels(&mut f, RenderTarget::ScreenCapture);
+            assert_eq!(
+                canary(&screenshot),
+                (0, 0),
+                "reverse={reverse}, resize={resize}: screenshot leaked"
+            );
+            if !reverse {
+                // Born ScreenCapture+Fill -> tightened to Screencast+Hide: screenshot stays Fill
+                // (occluding blue background with black replacement), never hidden or resurrected.
+                assert!(
+                    blue(&screenshot) < 128 * 128,
+                    "reverse={reverse}, resize={resize}: screenshot Fill became Hide"
+                );
+            }
+
+            let cast = pixels(&mut f, RenderTarget::Screencast);
+            assert_eq!(canary(&cast), (0, 0));
+            // Screencast must be Hide (full 128x128 blue background), whether first or second rule.
+            assert_eq!(
+                blue(&cast),
+                128 * 128,
+                "reverse={reverse}, resize={resize}: screencast did not remain/become Hide"
+            );
+        }
+    }
+}
+
+#[test]
+fn minimized_strip_hides_backdrop_for_hidden_window() {
+    let config = Config::parse_mem(
+        r##"
+        hotkey-overlay { skip-at-startup; }
+        layout { gaps 0; focus-ring { off; }; border { off; }; background-color "#0000ff"; }
+        minimized-windows { on; size 32; gaps 4; }
+        window-rule {
+            block-out-from "screen-capture" kind="hide"
+        }
+    "##,
+    )
+    .unwrap();
+    let mut f = Fixture::with_config(config);
+    if let Err(err) = f.niri_state().backend.headless().add_renderer() {
+        gpu::skip("capture privacy renderer", &err);
+        return;
+    }
+    f.add_output(1, (128, 128));
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    attach_window_pattern(window, 64, 64);
+    window.set_size(64, 64);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    assert!(f.niri().layout.minimize_window(&win));
+    f.double_roundtrip(id);
+
+    // Output draws the minimized thumbnail + translucent backdrop (darkening blue pixels).
+    let output_px = pixels(&mut f, RenderTarget::Output);
+    assert!(
+        blue(&output_px) < 128 * 128,
+        "output should show minimized strip thumbnail/backdrop"
+    );
+
+    // Capture targets must suppress both the thumbnail and the backdrop.
+    for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+        let px = pixels(&mut f, target);
+        assert_eq!(
+            blue(&px),
+            128 * 128,
+            "{target:?} leaked minimized strip thumbnail or backdrop"
+        );
     }
 }

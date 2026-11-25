@@ -7,8 +7,8 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, BoundAction, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds,
-    Trigger,
+    Action, Bind, Binds, BoundAction, Config, Key, ModKey, Modifiers, MruDirection, MruFilter,
+    MruScope, SwitchBinds, Trigger, WorkspaceReference,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -61,8 +61,9 @@ use crate::ui::minimized_strip;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
-use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::utils::{center, get_monotonic_time, with_toplevel_role, CastSessionId, ResizeEdge};
 use crate::window::mapped::MappedId;
+use crate::window::Mapped;
 
 pub mod backend_ext;
 pub mod click_grab;
@@ -953,6 +954,14 @@ impl State {
 
                 self.backend.suspend();
             }
+            Action::PowerKeySuspend => {
+                // Don't let the key press that woke the system up put it right back to sleep.
+                if self.niri.should_ignore_power_key() {
+                    return;
+                }
+
+                self.do_action(Action::Suspend, allow_when_locked, time);
+            }
             Action::PowerOffMonitors => {
                 self.niri.deactivate_monitors(&mut self.backend);
             }
@@ -1238,16 +1247,33 @@ impl State {
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::FocusWindowPrevious => {
-                let current = self.niri.layout.focus().map(|win| win.id());
-                if let Some(window) = self
-                    .niri
-                    .layout
+            Action::FocusWindowPrevious(scope, filter) => {
+                let layout = &self.niri.layout;
+                let current = layout.focus();
+                let app_id =
+                    |win: &Mapped| with_toplevel_role(win.toplevel(), |role| role.app_id.clone());
+
+                let current_app_id = current
+                    .filter(|_| filter == MruFilter::AppId)
+                    .and_then(app_id);
+
+                if let Some(window) = layout
                     .windows()
-                    .map(|(_, win)| win)
-                    .filter(|win| Some(win.id()) != current)
-                    .max_by_key(|win| win.get_focus_timestamp())
-                    .map(|win| win.window.clone())
+                    .filter(|(_, win)| Some(win.id()) != current.map(|win| win.id()))
+                    .filter(|(mon, win)| match scope {
+                        MruScope::All => true,
+                        MruScope::Output => mon.map(|mon| mon.output()) == layout.active_output(),
+                        MruScope::Workspace => layout
+                            .active_workspace()
+                            .is_some_and(|ws| ws.has_window(&win.window)),
+                    })
+                    .filter(|(_, win)| {
+                        current_app_id
+                            .as_ref()
+                            .is_none_or(|current| app_id(win).as_ref() == Some(current))
+                    })
+                    .max_by_key(|(_, win)| win.get_focus_timestamp())
+                    .map(|(_, win)| win.window.clone())
                 {
                     // Commit current focus so repeated focus-window-previous works as expected.
                     self.niri.mru_apply_keyboard_commit();
@@ -1270,36 +1296,36 @@ impl State {
                     }
                 });
             }
-            Action::MoveColumnLeft => {
+            Action::MoveColumnLeft(focus) => {
                 if self.niri.screenshot_ui.is_open() {
                     self.niri.screenshot_ui.move_left();
                 } else {
-                    self.niri.layout.move_left();
+                    self.niri.layout.move_left(focus);
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::MoveColumnRight => {
+            Action::MoveColumnRight(focus) => {
                 if self.niri.screenshot_ui.is_open() {
                     self.niri.screenshot_ui.move_right();
                 } else {
-                    self.niri.layout.move_right();
+                    self.niri.layout.move_right(focus);
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::MoveColumnToFirst => {
-                self.niri.layout.move_column_to_first();
+            Action::MoveColumnToFirst(focus) => {
+                self.niri.layout.move_column_to_first(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::MoveColumnToLast => {
-                self.niri.layout.move_column_to_last();
+            Action::MoveColumnToLast(focus) => {
+                self.niri.layout.move_column_to_last(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
                 self.niri.queue_redraw_all();
@@ -1316,7 +1342,7 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.move_left();
+                    self.niri.layout.move_left(true);
                     self.maybe_warp_cursor_to_focus();
                 }
 
@@ -1335,29 +1361,29 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.move_right();
+                    self.niri.layout.move_right(true);
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::MoveWindowDown => {
+            Action::MoveWindowDown(focus) => {
                 if self.niri.screenshot_ui.is_open() {
                     self.niri.screenshot_ui.move_down();
                 } else {
-                    self.niri.layout.move_down();
+                    self.niri.layout.move_down(focus);
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::MoveWindowUp => {
+            Action::MoveWindowUp(focus) => {
                 if self.niri.screenshot_ui.is_open() {
                     self.niri.screenshot_ui.move_up();
                 } else {
-                    self.niri.layout.move_up();
+                    self.niri.layout.move_up(focus);
                     self.maybe_warp_cursor_to_focus();
                 }
 
@@ -1660,43 +1686,35 @@ impl State {
                 self.niri.queue_redraw_all();
             }
             Action::MoveWindowToWorkspace(reference, focus) => {
-                if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
-                {
-                    // The source output is always the active output, so if the target output is
-                    // also the active output, we don't need to use move_to_output().
-                    if let Some(active) = self.niri.layout.active_output() {
-                        if output.as_ref() == Some(active) {
-                            output = None;
-                        }
-                    }
+                let Some((output, index)) = self.niri.resolve_workspace_reference(reference) else {
+                    return;
+                };
 
-                    let activate = if focus {
-                        ActivateWindow::Smart
-                    } else {
-                        ActivateWindow::No
-                    };
+                let activate = if focus {
+                    ActivateWindow::Smart
+                } else {
+                    ActivateWindow::No
+                };
 
-                    if let Some(output) = output {
-                        self.niri
-                            .layout
-                            .move_to_output(None, &output, Some(index), activate);
+                if let Some(output) = output {
+                    self.niri
+                        .layout
+                        .move_to_output(None, &output, Some(index), activate);
 
-                        if focus {
-                            if !self.maybe_warp_cursor_to_focus_centered() {
-                                self.move_cursor_to_output(&output);
-                            }
-                        } else {
-                            self.maybe_warp_cursor_to_focus();
+                    if focus {
+                        if !self.maybe_warp_cursor_to_focus_centered() {
+                            self.move_cursor_to_output(&output);
                         }
                     } else {
-                        self.niri.layout.move_to_workspace(None, index, activate);
                         self.maybe_warp_cursor_to_focus();
                     }
-
-                    // FIXME: granular
-                    self.niri.queue_redraw_all();
+                } else {
+                    self.niri.layout.move_to_workspace(None, index, activate);
+                    self.maybe_warp_cursor_to_focus();
                 }
+
+                // FIXME: granular
+                self.niri.queue_redraw_all();
             }
             Action::MoveWindowToWorkspaceById {
                 window_id: id,
@@ -1754,6 +1772,18 @@ impl State {
                     }
                 }
             }
+            Action::MoveWindowToNewWorkspaceBelow(reference, focus) => {
+                self.move_window_to_new_workspace(reference, true, focus);
+            }
+            Action::MoveWindowToNewWorkspaceAbove(reference, focus) => {
+                self.move_window_to_new_workspace(reference, false, focus);
+            }
+            Action::MoveColumnToNewWorkspaceBelow(reference, focus) => {
+                self.move_column_to_new_workspace(reference, true, focus);
+            }
+            Action::MoveColumnToNewWorkspaceAbove(reference, focus) => {
+                self.move_column_to_new_workspace(reference, false, focus);
+            }
             Action::MoveColumnToWorkspaceDown(focus) => {
                 self.niri.layout.move_column_to_workspace_down(focus);
                 self.maybe_warp_cursor_to_focus();
@@ -1767,35 +1797,29 @@ impl State {
                 self.niri.queue_redraw_all();
             }
             Action::MoveColumnToWorkspace(reference, focus) => {
-                if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
-                {
-                    if let Some(active) = self.niri.layout.active_output() {
-                        if output.as_ref() == Some(active) {
-                            output = None;
-                        }
-                    }
+                let Some((output, index)) = self.niri.resolve_workspace_reference(reference) else {
+                    return;
+                };
 
-                    if let Some(output) = output {
-                        self.niri
-                            .layout
-                            .move_column_to_output(&output, Some(index), focus);
-                        if focus && !self.maybe_warp_cursor_to_focus_centered() {
-                            self.move_cursor_to_output(&output);
-                        }
-                    } else {
-                        self.niri.layout.move_column_to_workspace(index, focus);
-                        if focus {
-                            self.maybe_warp_cursor_to_focus();
-                        }
+                if let Some(output) = output {
+                    self.niri
+                        .layout
+                        .move_column_to_output(&output, Some(index), focus);
+                    if focus && !self.maybe_warp_cursor_to_focus_centered() {
+                        self.move_cursor_to_output(&output);
                     }
-
-                    // FIXME: granular
-                    self.niri.queue_redraw_all();
+                } else {
+                    self.niri.layout.move_column_to_workspace(index, focus);
+                    if focus {
+                        self.maybe_warp_cursor_to_focus();
+                    }
                 }
+
+                // FIXME: granular
+                self.niri.queue_redraw_all();
             }
-            Action::MoveColumnToIndex(idx) => {
-                self.niri.layout.move_column_to_index(idx);
+            Action::MoveColumnToIndex(idx, focus) => {
+                self.niri.layout.move_column_to_index(idx, focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
                 self.niri.queue_redraw_all();
@@ -1835,35 +1859,29 @@ impl State {
                 }
             }
             Action::FocusWorkspace(reference) => {
-                if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
-                {
-                    if let Some(active) = self.niri.layout.active_output() {
-                        if output.as_ref() == Some(active) {
-                            output = None;
-                        }
-                    }
+                let Some((output, index)) = self.niri.resolve_workspace_reference(reference) else {
+                    return;
+                };
 
-                    if let Some(output) = output {
-                        self.niri.layout.focus_output(&output);
-                        self.niri.layout.switch_workspace(index);
-                        if !self.maybe_warp_cursor_to_focus_centered() {
-                            self.move_cursor_to_output(&output);
-                        }
+                if let Some(output) = output {
+                    self.niri.layout.focus_output(&output);
+                    self.niri.layout.switch_workspace(index);
+                    if !self.maybe_warp_cursor_to_focus_centered() {
+                        self.move_cursor_to_output(&output);
+                    }
+                } else {
+                    let config = &self.niri.config;
+                    if config.borrow().input.workspace_auto_back_and_forth {
+                        self.niri.layout.switch_workspace_auto_back_and_forth(index);
                     } else {
-                        let config = &self.niri.config;
-                        if config.borrow().input.workspace_auto_back_and_forth {
-                            self.niri.layout.switch_workspace_auto_back_and_forth(index);
-                        } else {
-                            self.niri.layout.switch_workspace(index);
-                        }
-                        self.maybe_warp_cursor_to_focus();
+                        self.niri.layout.switch_workspace(index);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
-
-                    // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.maybe_warp_cursor_to_focus();
                 }
+                self.niri.layer_shell_on_demand_focus = None;
+
+                // FIXME: granular
+                self.niri.queue_redraw_all();
             }
             Action::FocusWorkspacePrevious => {
                 self.niri.layout.switch_workspace_previous();
@@ -1921,18 +1939,18 @@ impl State {
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::SwapWindowRight => {
+            Action::SwapWindowRight(focus) => {
                 self.niri
                     .layout
-                    .swap_window_in_direction(ScrollDirection::Right);
+                    .swap_window_in_direction(ScrollDirection::Right, focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
                 self.niri.queue_redraw_all();
             }
-            Action::SwapWindowLeft => {
+            Action::SwapWindowLeft(focus) => {
                 self.niri
                     .layout
-                    .swap_window_in_direction(ScrollDirection::Left);
+                    .swap_window_in_direction(ScrollDirection::Left, focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
                 self.niri.queue_redraw_all();
@@ -2845,6 +2863,69 @@ impl State {
         }
     }
 
+    fn move_window_to_new_workspace(
+        &mut self,
+        reference: Option<WorkspaceReference>,
+        below: bool,
+        focus: bool,
+    ) {
+        let reference = match reference.map(|r| self.niri.resolve_workspace_reference(r)) {
+            None => None,         // Use focused workspace.
+            Some(None) => return, // Workspace wasn't found.
+            Some(Some(r)) => Some(r),
+        };
+        let target_output = reference.as_ref().and_then(|(output, _)| output.clone());
+
+        self.niri
+            .layout
+            .move_to_new_workspace(reference, below, focus);
+
+        match target_output {
+            Some(output) if focus => {
+                if !self.maybe_warp_cursor_to_focus_centered() {
+                    self.move_cursor_to_output(&output);
+                }
+            }
+            _ => {
+                self.maybe_warp_cursor_to_focus();
+            }
+        }
+
+        // FIXME: granular
+        self.niri.queue_redraw_all();
+    }
+
+    fn move_column_to_new_workspace(
+        &mut self,
+        reference: Option<WorkspaceReference>,
+        below: bool,
+        focus: bool,
+    ) {
+        let reference = match reference.map(|r| self.niri.resolve_workspace_reference(r)) {
+            None => None,         // Use focused workspace.
+            Some(None) => return, // Workspace wasn't found.
+            Some(Some(r)) => Some(r),
+        };
+        let target_output = reference.as_ref().and_then(|(output, _)| output.clone());
+
+        self.niri
+            .layout
+            .move_column_to_new_workspace(reference, below, focus);
+
+        if focus {
+            if let Some(output) = target_output {
+                if !self.maybe_warp_cursor_to_focus_centered() {
+                    self.move_cursor_to_output(&output);
+                }
+            } else {
+                self.maybe_warp_cursor_to_focus();
+            }
+        }
+
+        // FIXME: granular
+        self.niri.queue_redraw_all();
+    }
+
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
         let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
         // Any of the early returns here mean that the pointer is not inside the hot corner.
@@ -3031,7 +3112,9 @@ impl State {
             }
         }
 
-        self.niri.handle_focus_follows_mouse(&under);
+        if !pointer.is_grabbed() {
+            self.niri.handle_focus_follows_mouse(pos, &under);
+        }
 
         self.niri.pointer_contents.clone_from(&under);
 
@@ -3134,7 +3217,10 @@ impl State {
 
         let under = self.niri.contents_under(pos);
 
-        self.niri.handle_focus_follows_mouse(&under);
+        if !pointer.is_grabbed() {
+            let prev_location = pointer.current_location();
+            self.niri.handle_focus_follows_mouse(prev_location, &under);
+        }
 
         self.niri.pointer_contents.clone_from(&under);
 
@@ -4202,6 +4288,15 @@ impl State {
         let tablet_seat = self.niri.seat.tablet_seat();
         let tool = tablet_seat.get_tool(&event.tool());
         if let Some(tool) = tool {
+            if !tool.is_grabbed() && self.niri.popup_grab.is_none() {
+                let prev_location = self.niri.tablet_cursor_location.unwrap_or_else(|| {
+                    // Do focus-follows-mouse when entering the tablet.
+                    let pointer = self.niri.seat.get_pointer().unwrap();
+                    pointer.current_location()
+                });
+                self.niri.handle_focus_follows_mouse(prev_location, &under);
+            }
+
             let time = event.time();
 
             let frame = tablet::tool::AxisFrame {
@@ -4418,6 +4513,15 @@ impl State {
 
             match event.state() {
                 ProximityState::In => {
+                    if !tool.is_grabbed() && self.niri.popup_grab.is_none() {
+                        let prev_location = self.niri.tablet_cursor_location.unwrap_or_else(|| {
+                            // Do focus-follows-mouse when entering the tablet.
+                            let pointer = self.niri.seat.get_pointer().unwrap();
+                            pointer.current_location()
+                        });
+                        self.niri.handle_focus_follows_mouse(prev_location, &under);
+                    }
+
                     let frame = tablet::tool::AxisFrame {
                         pressure: event.pressure_has_changed().then(|| event.pressure()),
                         distance: event.distance_has_changed().then(|| event.distance()),
@@ -5207,6 +5311,27 @@ impl Niri {
         retain_press_binds(&mut self.pending_mouse_release_binds);
         retain_press_binds(&mut self.pending_tablet_release_binds);
     }
+
+    /// Returns output and workspace index for a workspace reference.
+    ///
+    /// The output is `None` if it matches the active output (because in this case, no cross-output
+    /// movement is necessary).
+    ///
+    /// Returns `None` if the reference doesn't match any workspace.
+    fn resolve_workspace_reference(
+        &self,
+        reference: WorkspaceReference,
+    ) -> Option<(Option<Output>, usize)> {
+        let (mut output, index) = self.find_output_and_workspace_index(reference)?;
+        if let Some(active) = self.layout.active_output() {
+            if output.as_ref() == Some(active) {
+                // No cross-output window movement is necessary.
+                output = None;
+            }
+        }
+
+        Some((output, index))
+    }
 }
 
 fn retain_press_binds<K>(binds: &mut HashMap<K, Bind>) {
@@ -5254,7 +5379,6 @@ fn is_bind_on_cooldown(bind: &Bind, cooldown_timers: &HashMap<Key, RegistrationT
 ///
 /// A bind whose press action is rate-limited by its cooldown is skipped entirely:
 /// No action runs, and no release action is recorded.
-#[allow(clippy::too_many_arguments)]
 fn should_intercept_key<'a>(
     suppressed_keys: &mut HashSet<Keycode>,
     pending_release_binds: &mut HashMap<Keycode, Bind>,
@@ -5349,7 +5473,7 @@ fn find_bind<'a, I: Iterator<Item = &'a Bind> + Clone>(
             let vt = (modified - KEY_XF86Switch_VT_1 + 1) as u8;
             Some(Action::ChangeVt(vt))
         }
-        KEY_XF86PowerOff if !disable_power_key_handling => Some(Action::Suspend),
+        KEY_XF86PowerOff if !disable_power_key_handling => Some(Action::PowerKeySuspend),
         _ => None,
     };
 
@@ -5612,6 +5736,7 @@ fn allowed_when_locked(action: &Action) -> bool {
         action,
         Action::ChangeVt(_)
             | Action::Suspend
+            | Action::PowerKeySuspend
             | Action::PowerOffMonitors
             | Action::PowerOnMonitors
             | Action::SwitchLayout(_)
@@ -5659,6 +5784,7 @@ fn allowed_during_screenshot(action: &Action) -> bool {
         Action::Quit(_)
             | Action::ChangeVt(_)
             | Action::Suspend
+            | Action::PowerKeySuspend
             | Action::PowerOffMonitors
             | Action::PowerOnMonitors
             | Action::ToggleTouchpad
@@ -5666,13 +5792,13 @@ fn allowed_during_screenshot(action: &Action) -> bool {
             | Action::Spawn(_)
             | Action::SpawnSh(_)
             // The screenshot UI can handle these.
-            | Action::MoveColumnLeft
+            | Action::MoveColumnLeft(_)
             | Action::MoveColumnLeftOrToMonitorLeft
-            | Action::MoveColumnRight
+            | Action::MoveColumnRight(_)
             | Action::MoveColumnRightOrToMonitorRight
-            | Action::MoveWindowUp
+            | Action::MoveWindowUp(_)
             | Action::MoveWindowUpOrToWorkspaceUp
-            | Action::MoveWindowDown
+            | Action::MoveWindowDown(_)
             | Action::MoveWindowDownOrToWorkspaceDown
             | Action::MoveColumnToMonitorLeft
             | Action::MoveColumnToMonitorRight
@@ -6652,15 +6778,15 @@ mod tests {
         // allowed while the screenshot UI is open.
         let both = |press, release| close_bind(BoundAction::Both { press, release });
         assert!(!bind_allowed_during_screenshot(
-            &both(Action::MoveColumnLeft, Action::CloseWindow),
+            &both(Action::MoveColumnLeft(true), Action::CloseWindow),
             true
         ));
         assert!(!bind_allowed_during_screenshot(
-            &both(Action::CloseWindow, Action::MoveColumnLeft),
+            &both(Action::CloseWindow, Action::MoveColumnLeft(true)),
             true
         ));
         assert!(bind_allowed_during_screenshot(
-            &both(Action::MoveColumnLeft, Action::MoveWindowUp),
+            &both(Action::MoveColumnLeft(true), Action::MoveWindowUp(true)),
             true
         ));
     }
@@ -6668,7 +6794,7 @@ mod tests {
     #[test]
     fn bind_allowed_during_screenshot_requires_only_the_single_action() {
         assert!(bind_allowed_during_screenshot(
-            &close_bind(BoundAction::Press(Action::MoveColumnLeft)),
+            &close_bind(BoundAction::Press(Action::MoveColumnLeft(true))),
             true
         ));
         assert!(!bind_allowed_during_screenshot(
@@ -6683,17 +6809,17 @@ mod tests {
         // not block it.
         let both = |press, release| close_bind(BoundAction::Both { press, release });
         assert!(bind_allowed_during_screenshot(
-            &both(Action::MoveColumnLeft, Action::CloseWindow),
+            &both(Action::MoveColumnLeft(true), Action::CloseWindow),
             false
         ));
         assert!(bind_allowed_during_screenshot(
-            &both(Action::CloseWindow, Action::MoveColumnLeft),
+            &both(Action::CloseWindow, Action::MoveColumnLeft(true)),
             false
         ));
 
         // A release-only bind has no press to undo, so its own action must be allowed.
         assert!(bind_allowed_during_screenshot(
-            &close_bind(BoundAction::Release(Action::MoveColumnLeft)),
+            &close_bind(BoundAction::Release(Action::MoveColumnLeft(true))),
             false
         ));
         assert!(!bind_allowed_during_screenshot(

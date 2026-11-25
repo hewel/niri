@@ -398,7 +398,6 @@ impl PipeWire {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn start_cast(
         &self,
         gbm: Option<(GbmDevice<DeviceFd>, FormatSet)>,
@@ -484,15 +483,52 @@ impl PipeWire {
 
                                     let _span = tracy_client::span!("sending PipeWireStreamAdded");
                                     async_io::block_on(async {
-                                        let res =
+                                        let res_v1 =
                                             mutter_screen_cast::Stream::pipe_wire_stream_added(
                                                 &signal_ctx,
                                                 id,
                                             )
                                             .await;
 
-                                        if let Err(err) = res {
+                                        if let Err(err) = &res_v1 {
                                             warn!("error sending PipeWireStreamAdded: {err:?}");
+                                        }
+
+                                        // PipeWireStreamAddedV2 is like PipeWireStreamAdded, but
+                                        // with the node serial-id, added in ScreenCast V6. Both
+                                        // versions are sent for backward compability.
+                                        //
+                                        // Based on Mutter implementation: https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5467
+                                        // xdp-gnome implementation: https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/merge_requests/276
+
+                                        // The value is required, so defaults to 0, following the
+                                        // Mutter implementation
+                                        let serial = stream
+                                            .properties()
+                                            .get("object.serial")
+                                            .and_then(|s| s.parse().ok())
+                                            .unwrap_or(0);
+
+                                        trace!(
+                                            "sending PipeWireStreamAddedV2 with serial {serial}"
+                                        );
+
+                                        let props = mutter_screen_cast::PipeWireStreamProperties {
+                                            node_id: id,
+                                            node_serial: serial,
+                                        };
+                                        let res_v2 =
+                                            mutter_screen_cast::Stream::pipe_wire_stream_added_v2(
+                                                &signal_ctx,
+                                                props,
+                                            )
+                                            .await;
+
+                                        if let Err(err) = &res_v2 {
+                                            warn!("error sending PipeWireStreamAddedV2: {err:?}");
+                                        }
+
+                                        if res_v1.is_err() && res_v2.is_err() {
                                             stop_cast();
                                         }
                                     });
@@ -1278,11 +1314,21 @@ impl Cast {
             trace!("no damage, skipping frame");
             return false;
         }
-        *last_cursor_location = Some(cursor_data.location);
         drop(inner);
 
         let Some(pw_buffer) = self.dequeue_available_buffer() else {
             warn!("no available buffer in pw stream, skipping frame");
+            // `damage_output` already updated `last_state` above; clear the trackers so the next
+            // redraw after a buffer returns re-renders the undelivered frame.
+            if let CastState::Ready {
+                damage_tracker,
+                cursor_damage_tracker,
+                ..
+            } = &mut self.inner.borrow_mut().state
+            {
+                *damage_tracker = None;
+                *cursor_damage_tracker = None;
+            }
             return false;
         };
         let buffer = pw_buffer.as_ptr();
@@ -1291,12 +1337,14 @@ impl Cast {
         let inner_ = &mut *inner;
         let CastState::Ready {
             damage_tracker,
+            last_cursor_location,
             alpha,
             ..
         } = &mut inner_.state
         else {
             unreachable!()
         };
+        *last_cursor_location = Some(cursor_data.location);
         let damage_tracker = damage_tracker.as_mut().unwrap();
         let alpha = *alpha;
 
@@ -1346,6 +1394,15 @@ impl Cast {
                 Err(err) => {
                     warn!("error rendering to buffer: {err:?}");
                     return_unused_buffer(&self.stream, pw_buffer);
+                    if let CastState::Ready {
+                        damage_tracker,
+                        cursor_damage_tracker,
+                        ..
+                    } = &mut self.inner.borrow_mut().state
+                    {
+                        *damage_tracker = None;
+                        *cursor_damage_tracker = None;
+                    }
                     false
                 }
             }

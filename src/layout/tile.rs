@@ -27,7 +27,9 @@ use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::{NiriCaptureRenderer, NiriRenderer};
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::snapshot::{RenderSnapshot, SnapshotBackground, SnapshotTexture};
+use crate::render_helpers::snapshot::{
+    BlockOutState, RenderSnapshot, SnapshotBackground, SnapshotTexture,
+};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::UniversalTextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -1009,21 +1011,23 @@ impl<W: LayoutElement> Tile<W> {
         animate: bool,
         transaction: Option<Transaction>,
     ) {
-        self.window.request_size(
-            size.to_i32_round(),
-            SizingMode::Maximized,
-            animate,
-            transaction,
-        );
+        let size = size.to_i32_round();
+        let rules = self.window.rules();
+        let size = rules.apply_max_size(size);
+        let size = rules.apply_min_size(size);
+
+        self.window
+            .request_size(size, SizingMode::Maximized, animate, transaction);
     }
 
     pub fn request_fullscreen(&mut self, animate: bool, transaction: Option<Transaction>) {
-        self.window.request_size(
-            self.view_size.to_i32_round(),
-            SizingMode::Fullscreen,
-            animate,
-            transaction,
-        );
+        let size = self.view_size.to_i32_round();
+        let rules = self.window.rules();
+        let size = rules.apply_max_size(size);
+        let size = rules.apply_min_size(size);
+
+        self.window
+            .request_size(size, SizingMode::Fullscreen, animate, transaction);
     }
 
     pub fn min_size_nonfullscreen(&self) -> Size<f64, Logical> {
@@ -1159,14 +1163,13 @@ impl<W: LayoutElement> Tile<W> {
 
                     // Clip blocked-out resizes unconditionally because they use solid color render
                     // elements.
-                    let clip_to_geometry =
-                        if ctx.target.should_block_out(resize.snapshot.block_out_from)
-                            && ctx.target.should_block_out(rules.block_out_from)
-                        {
-                            true
-                        } else {
-                            clip_to_geometry
-                        };
+                    let clip_to_geometry = if resize.snapshot.should_block_out(ctx.target)
+                        && ctx.target.should_block_out(rules.block_out_from)
+                    {
+                        true
+                    } else {
+                        clip_to_geometry
+                    };
 
                     if let Some((elem_current, _sync_point, mut data)) = current {
                         let texture_current = elem_current.texture().clone();
@@ -1204,7 +1207,7 @@ impl<W: LayoutElement> Tile<W> {
             if !pushed_resize {
                 // A protected capture must fail closed even if its black texture cannot
                 // be rendered. Keep the normal Output diagnostic fallback unchanged.
-                let color = if ctx.target.should_block_out(resize.snapshot.block_out_from) {
+                let color = if resize.snapshot.should_block_out(ctx.target) {
                     [0., 0., 0., 1.]
                 } else {
                     [1., 0., 0., 1.]
@@ -1392,6 +1395,10 @@ impl<W: LayoutElement> Tile<W> {
         R::Error: Send + Sync + 'static,
         TileRenderElement<R>: RenderElement<R>,
     {
+        if ctx.target.should_hide(self.window.rules().block_out_from) {
+            return;
+        }
+
         let _span = tracy_client::span!("Tile::render");
 
         let scale = Scale::from(self.scale);
@@ -1550,6 +1557,10 @@ impl<W: LayoutElement> Tile<W> {
             Default::default();
         let mut previous = RenderTarget::Output;
         for target in [RenderTarget::ScreenCapture, RenderTarget::Screencast] {
+            if target.should_hide(block_out_from) {
+                capture_textures[target as usize] = Some(OnceCell::from(None));
+                continue;
+            }
             if key(target) == key(RenderTarget::Output) {
                 continue;
             }
@@ -1573,7 +1584,7 @@ impl<W: LayoutElement> Tile<W> {
             capture_textures,
             background,
             blocked_out_contents: Vec::new(),
-            block_out_from,
+            block_out_states: BlockOutState::array_from_rule(block_out_from),
             size: self.animated_tile_size(),
             texture: OnceCell::from(texture),
             blocked_out_texture: Default::default(),
